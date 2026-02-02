@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xtm.monthlyreport</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/jayjay5032/Desktop/MartinMonthlyReport/generate_report.py</string>
+        <string>--auto-send</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/jayjay5032/Desktop/MartinMonthlyReport</string>
+
+    <!-- Run on the 1st of every month at 9:00 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Day</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/jayjay5032/Desktop/MartinMonthlyReport/xtm_report.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/jayjay5032/Desktop/MartinMonthlyReport/xtm_report_error.log</string>
+
+    <!-- Run even when user is not logged in -->
+    <key>RunAtLoad</key>
+    <false/>
+</dict>
+</plist>
