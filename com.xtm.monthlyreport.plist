@@ -7,9 +7,8 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/usr/bin/python3</string>
-        <string>/Users/jayjay5032/Desktop/MartinMonthlyReport/generate_report.py</string>
-        <string>--auto-send</string>
+        <string>/bin/bash</string>
+        <string>/Users/jayjay5032/Desktop/MartinMonthlyReport/run_report_with_retry.sh</string>
     </array>
 
     <key>WorkingDirectory</key>
@@ -35,5 +34,20 @@
     <!-- Run even when user is not logged in -->
     <key>RunAtLoad</key>
     <false/>
+
+    <!-- Set nice value to run with lower priority -->
+    <key>Nice</key>
+    <integer>1</integer>
+
+    <!-- Set process timeout to 30 minutes -->
+    <key>ExitTimeOut</key>
+    <integer>1800</integer>
+
+    <!-- Environment variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
 </dict>
 </plist>

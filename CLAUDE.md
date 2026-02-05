@@ -39,12 +39,28 @@ python3 test_single_project.py
 # Test the automation configuration
 ./test_automation.sh
 
+# Test resilience features (retry, health checks, etc.)
+python3 test_resilience.py
+
 # Check if automation is running
 launchctl list | grep xtm
 
 # View logs
 tail -f xtm_report.log
 ```
+
+### Resilience Features
+
+The automation includes multiple layers of error handling to ensure it never fails:
+
+1. **API Retry Logic**: All API requests automatically retry up to 5 times with exponential backoff (2s, 4s, 8s, 16s, 32s)
+2. **Shell-Level Retry**: The wrapper script retries the entire process 3 times with 5-minute delays between attempts
+3. **Graceful Degradation**: If individual projects fail, the script continues processing remaining projects
+4. **Multiple Fallback Locations**: If the primary save location fails, tries Desktop → Current Directory → Temp Directory
+5. **Health Checks**: Validates API connectivity, disk space, permissions, and configuration before starting
+6. **Failure Notifications**: Sends macOS system notifications and email alerts when critical failures occur
+7. **Partial Data Handling**: Generates reports even when only partial data is available
+8. **Email Fallback**: Tries Outlook → Apple Mail → Just saves file if email fails
 
 ## Architecture
 
@@ -188,3 +204,56 @@ This tool is designed for macOS and uses:
 - System Events for app detection
 
 Windows or Linux would require significant changes to email automation.
+
+## Troubleshooting
+
+### Automation Not Running
+
+```bash
+# Check if LaunchAgent is loaded
+launchctl list | grep xtm
+
+# If not loaded, reload it
+./setup_schedule.sh
+
+# Check logs for errors
+tail -50 xtm_report.log
+tail -50 xtm_report_error.log
+```
+
+### API Failures
+
+The system automatically retries API failures, but if they persist:
+- Check `xtm_config.json` auth_token is valid
+- Verify XTM Cloud API is accessible: `curl -H "Authorization: XTM-Basic <token>" https://your-instance.xtm-intl.com/rest-api/projects`
+- Check `xtm_report.log` for `xtm-trace-id` values to share with XTM support
+
+### Email Not Sending
+
+The system tries multiple email methods automatically:
+1. Microsoft Outlook (preferred)
+2. Apple Mail (fallback)
+3. Saves report locally (last resort)
+
+If email consistently fails, check:
+- Outlook/Mail is properly configured with your account
+- Recipients in `xtm_config.json` are valid email addresses
+- macOS permissions allow the script to control Mail/Outlook
+
+### Reports Not Saving
+
+The system tries multiple save locations:
+1. OneDrive path from config (preferred)
+2. Desktop (fallback)
+3. Current working directory (fallback)
+4. Temp directory (last resort)
+
+If all fail, check disk space and permissions.
+
+### No Data in Reports
+
+Check:
+- Projects exist in XTM Cloud for the reporting period
+- Projects have `lastCompletionDate` set (work was completed)
+- Excluded users list in `generate_report.py` isn't filtering out all users
+- Date range is correct (reports on previous complete month)

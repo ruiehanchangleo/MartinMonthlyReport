@@ -11,9 +11,11 @@ import logging
 import sys
 import subprocess
 import platform
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Callable
+from functools import wraps
 import requests
 from openpyxl import Workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -31,6 +33,63 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
+
+def retry_with_backoff(max_attempts=5, initial_delay=1, backoff_factor=2, max_delay=60):
+    """
+    Decorator that retries a function with exponential backoff.
+
+    Args:
+        max_attempts: Maximum number of retry attempts
+        initial_delay: Initial delay in seconds
+        backoff_factor: Multiplier for delay after each attempt
+        max_delay: Maximum delay between retries in seconds
+    """
+    def decorator(func: Callable) -> Callable:
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            delay = initial_delay
+            last_exception = None
+
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    return func(*args, **kwargs)
+                except requests.exceptions.Timeout as e:
+                    last_exception = e
+                    logger.warning(f"Timeout on attempt {attempt}/{max_attempts} for {func.__name__}: {e}")
+                except requests.exceptions.ConnectionError as e:
+                    last_exception = e
+                    logger.warning(f"Connection error on attempt {attempt}/{max_attempts} for {func.__name__}: {e}")
+                except requests.exceptions.HTTPError as e:
+                    last_exception = e
+                    # Don't retry on 4xx errors (client errors) except 429 (rate limit)
+                    if hasattr(e, 'response') and e.response is not None:
+                        status_code = e.response.status_code
+                        if 400 <= status_code < 500 and status_code != 429:
+                            logger.error(f"Client error {status_code} for {func.__name__}, not retrying: {e}")
+                            raise
+                    logger.warning(f"HTTP error on attempt {attempt}/{max_attempts} for {func.__name__}: {e}")
+                except requests.exceptions.RequestException as e:
+                    last_exception = e
+                    logger.warning(f"Request error on attempt {attempt}/{max_attempts} for {func.__name__}: {e}")
+                except Exception as e:
+                    # Don't retry on unexpected exceptions
+                    logger.error(f"Unexpected error in {func.__name__}: {e}")
+                    raise
+
+                # If this wasn't the last attempt, wait before retrying
+                if attempt < max_attempts:
+                    wait_time = min(delay, max_delay)
+                    logger.info(f"Retrying {func.__name__} in {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    delay *= backoff_factor
+
+            # All attempts failed
+            logger.error(f"All {max_attempts} attempts failed for {func.__name__}")
+            raise last_exception
+
+        return wrapper
+    return decorator
 
 
 class XTMReportGenerator:
@@ -129,8 +188,29 @@ class XTMReportGenerator:
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration from JSON file."""
         try:
+            config_file = Path(config_path)
+            if not config_file.exists():
+                raise FileNotFoundError(f"Configuration file not found: {config_path}")
+
             with open(config_path, 'r') as f:
-                return json.load(f)
+                config = json.load(f)
+
+            # Validate required configuration keys
+            required_keys = ['base_url', 'auth_type', 'auth_token', 'onedrive_path', 'email_recipients']
+            missing_keys = [key for key in required_keys if key not in config]
+            if missing_keys:
+                raise ValueError(f"Missing required config keys: {', '.join(missing_keys)}")
+
+            # Validate auth token is not empty
+            if not config.get('auth_token') or config['auth_token'].strip() == '':
+                raise ValueError("Authentication token is empty")
+
+            # Validate email recipients
+            if not isinstance(config.get('email_recipients'), list) or not config['email_recipients']:
+                logger.warning("No email recipients configured")
+
+            logger.info("Configuration loaded and validated successfully")
+            return config
         except Exception as e:
             logger.error(f"Failed to load config: {e}")
             raise
@@ -139,22 +219,116 @@ class XTMReportGenerator:
         """Convert locale code to language name."""
         return self.LOCALE_TO_LANGUAGE.get(locale_code, locale_code)
 
+    def _run_health_checks(self) -> bool:
+        """Run comprehensive health checks before starting report generation."""
+        logger.info("Running health checks...")
+        all_passed = True
+
+        # 1. Check API connectivity
+        try:
+            logger.info("Checking API connectivity...")
+            test_response = self._make_request('projects', params={'count': 1})
+            logger.info("✓ API connectivity check passed")
+        except Exception as e:
+            logger.error(f"✗ API connectivity check failed: {e}")
+            all_passed = False
+
+        # 2. Check output directory
+        try:
+            logger.info("Checking output directory...")
+            output_dir = Path(self.config['onedrive_path'])
+
+            # Check if directory exists or can be created
+            if not output_dir.exists():
+                try:
+                    output_dir.mkdir(parents=True, exist_ok=True)
+                    logger.info(f"✓ Created output directory: {output_dir}")
+                except Exception as e:
+                    logger.warning(f"⚠ Cannot create primary output directory, will use fallback: {e}")
+
+            # Check write permissions
+            if output_dir.exists():
+                test_file = output_dir / '.write_test'
+                try:
+                    test_file.write_text('test')
+                    test_file.unlink()
+                    logger.info(f"✓ Output directory is writable: {output_dir}")
+                except Exception as e:
+                    logger.warning(f"⚠ Output directory not writable, will use fallback: {e}")
+            else:
+                logger.warning(f"⚠ Output directory does not exist, will use fallback locations")
+
+        except Exception as e:
+            logger.warning(f"⚠ Output directory check failed, will use fallback: {e}")
+
+        # 3. Check disk space (warn if less than 100MB free)
+        try:
+            logger.info("Checking disk space...")
+            import shutil
+            stat = shutil.disk_usage(Path.home())
+            free_mb = stat.free / (1024 * 1024)
+            if free_mb < 100:
+                logger.warning(f"⚠ Low disk space: {free_mb:.0f}MB free")
+            else:
+                logger.info(f"✓ Sufficient disk space: {free_mb:.0f}MB free")
+        except Exception as e:
+            logger.warning(f"⚠ Could not check disk space: {e}")
+
+        # 4. Check required Python packages
+        try:
+            logger.info("Checking required packages...")
+            import openpyxl
+            import requests
+            logger.info("✓ All required packages are available")
+        except ImportError as e:
+            logger.error(f"✗ Missing required package: {e}")
+            all_passed = False
+
+        # 5. Validate date calculations
+        try:
+            logger.info("Validating date calculations...")
+            if not self.report_month or not self.ytd_start_month:
+                raise ValueError("Invalid date calculations")
+            logger.info(f"✓ Report period: {self.report_month_name}")
+            logger.info(f"✓ YTD period: {self.ytd_start_month} to {self.ytd_end_month}")
+        except Exception as e:
+            logger.error(f"✗ Date validation failed: {e}")
+            all_passed = False
+
+        if all_passed:
+            logger.info("✓ All critical health checks passed")
+        else:
+            logger.warning("⚠ Some health checks failed, but will attempt to continue")
+
+        return all_passed
+
+    @retry_with_backoff(max_attempts=5, initial_delay=2, backoff_factor=2, max_delay=60)
     def _make_request(self, endpoint: str, method: str = 'GET', params: Dict = None, data: Dict = None) -> Any:
         """Make API request to XTM with error handling."""
         url = f"{self.base_url}/{endpoint}"
         try:
             logger.info(f"Making {method} request to {endpoint}")
             if method == 'GET':
-                response = requests.get(url, headers=self.headers, params=params, timeout=30)
+                response = requests.get(url, headers=self.headers, params=params, timeout=60)
             elif method == 'POST':
-                response = requests.post(url, headers=self.headers, json=data, timeout=30)
+                response = requests.post(url, headers=self.headers, json=data, timeout=60)
             else:
                 raise ValueError(f"Unsupported method: {method}")
+
+            # Log the xtm-trace-id header for support purposes
+            trace_id = response.headers.get('xtm-trace-id', 'N/A')
+            logger.info(f"XTM Trace ID: {trace_id} | Endpoint: {endpoint} | Status: {response.status_code}")
 
             response.raise_for_status()
             return response.json() if response.content else {}
         except requests.exceptions.RequestException as e:
-            logger.error(f"API request failed: {e}")
+            # Also log trace ID on error if available
+            trace_id = 'N/A'
+            if hasattr(e, 'response') and e.response is not None:
+                trace_id = e.response.headers.get('xtm-trace-id', 'N/A')
+                logger.error(f"API request failed | XTM Trace ID: {trace_id} | Error: {e}")
+            else:
+                logger.error(f"API request failed: {e}")
             raise
 
     def get_projects(self, status: str = None) -> List[Dict]:
@@ -273,53 +447,26 @@ class XTMReportGenerator:
             if not project_id:
                 continue
 
-            # Filter projects by month (if date available)
-            project_date = project.get('createdDate') or project.get('modificationDate')
-            readable_date = None
-            project_month = None
-
-            if project_date:
-                try:
-                    if isinstance(project_date, (int, float)):
-                        dt = datetime.fromtimestamp(project_date / 1000)
-                        readable_date = dt.strftime('%Y-%m-%d')
-                        project_month = dt.strftime('%Y-%m')
-                except:
-                    readable_date = str(project_date)
-
-            # Skip projects outside the date range (only if we have a valid date)
-            # If no date is available, include the project
-            if project_month:
-                if project_month < start_month or project_month > end_month:
-                    continue
-            # If no date available, include all projects (they might still have metrics)
-
-            # Update project stats
-            data['project_stats']['total'] += 1
-            status = project.get('status', 'UNKNOWN')
-
-            if status == 'FINISHED':
-                data['project_stats']['completed'] += 1
-            elif status in ['IN_PROGRESS', 'STARTED']:
-                data['project_stats']['in_progress'] += 1
-            else:
-                data['project_stats']['pending'] += 1
-
-            # Get project statistics (filtered to exclude leo.chang@familysearch.org)
-            stats_list = self.get_project_statistics(project_id)
+            # Get project statistics (filtered to exclude specified users)
+            # Wrap in try-except to continue even if individual projects fail
+            try:
+                stats_list = self.get_project_statistics(project_id)
+            except Exception as e:
+                logger.warning(f"Failed to get statistics for project {project_id}, skipping: {e}")
+                continue
 
             # Process each target language in the statistics
             if isinstance(stats_list, list) and stats_list:
                 project_total_words = 0
+                project_has_work_in_period = False
                 target_languages = []
                 source_lang = 'en_US'  # Default, will try to determine from context
 
                 for lang_stats in stats_list:
                     target_lang_code = lang_stats.get('targetLanguage', 'unknown')
                     target_lang_name = self._locale_to_language_name(target_lang_code)
-                    target_languages.append(target_lang_name)
 
-                    # Aggregate words from all users (already filtered to exclude leo.chang@familysearch.org)
+                    # Aggregate words from all users (already filtered to exclude specified users)
                     users_statistics = lang_stats.get('usersStatistics', [])
 
                     for user_stats in users_statistics:
@@ -336,67 +483,121 @@ class XTMReportGenerator:
                             step_total_words = 0
 
                             for job_stat in jobs_statistics:
-                                # Sum words from different metrics (source statistics total words)
+                                # Filter by finish date (lastCompletionDate)
+                                # If blank, ignore this job
+                                last_completion_date = job_stat.get('lastCompletionDate')
+                                completion_month = None
+
+                                if last_completion_date:
+                                    try:
+                                        if isinstance(last_completion_date, (int, float)):
+                                            dt = datetime.fromtimestamp(last_completion_date / 1000)
+                                            completion_month = dt.strftime('%Y-%m')
+                                    except:
+                                        pass
+
+                                # Skip work not completed in the target date range
+                                if completion_month:
+                                    if completion_month < start_month or completion_month > end_month:
+                                        continue
+                                else:
+                                    # If no completion date, skip this job
+                                    continue
+
+                                # Calculate total words using all match type fields:
+                                # iceMatchWords + leveragedWords + repeatsWords + machineTranslationWords +
+                                # highFuzzyMatchWords + mediumFuzzyMatchWords + lowFuzzyMatchWords +
+                                # highFuzzyRepeatsWords + mediumFuzzyRepeatsWords + lowFuzzyRepeatsWords +
+                                # noMatchingWords
                                 source_stats = job_stat.get('sourceStatistics', {})
-                                step_total_words += source_stats.get('totalWords', 0)
+                                ice_match_words = source_stats.get('iceMatchWords', 0)
+                                leveraged_words = source_stats.get('leveragedWords', 0)
+                                repeats_words = source_stats.get('repeatsWords', 0)
+                                machine_translation_words = source_stats.get('machineTranslationWords', 0)
+                                high_fuzzy_match_words = source_stats.get('highFuzzyMatchWords', 0)
+                                medium_fuzzy_match_words = source_stats.get('mediumFuzzyMatchWords', 0)
+                                low_fuzzy_match_words = source_stats.get('lowFuzzyMatchWords', 0)
+                                high_fuzzy_repeats_words = source_stats.get('highFuzzyRepeatsWords', 0)
+                                medium_fuzzy_repeats_words = source_stats.get('mediumFuzzyRepeatsWords', 0)
+                                low_fuzzy_repeats_words = source_stats.get('lowFuzzyRepeatsWords', 0)
+                                no_matching_words = source_stats.get('noMatchingWords', 0)
 
-                            # Create unique key for workflow step + language (using language name)
+                                job_words = (ice_match_words + leveraged_words + repeats_words + machine_translation_words +
+                                           high_fuzzy_match_words + medium_fuzzy_match_words + low_fuzzy_match_words +
+                                           high_fuzzy_repeats_words + medium_fuzzy_repeats_words + low_fuzzy_repeats_words +
+                                           no_matching_words)
+                                step_total_words += job_words
+
+                            # Mark that this project has work
+                            if step_total_words > 0:
+                                project_has_work_in_period = True
+
+                            # Only aggregate if this step had words in the target period
+                            if step_total_words > 0:
+                                # Add language to list if not already there
+                                if target_lang_name not in target_languages:
+                                    target_languages.append(target_lang_name)
+
+                                # Create unique key for workflow step + language (using language name)
+                                workflow_key = f"{clean_step_name} - {target_lang_name}"
+
+                                if workflow_key not in data['workflow_by_language']:
+                                    data['workflow_by_language'][workflow_key] = {
+                                        'workflow_step': clean_step_name,
+                                        'language': target_lang_name,
+                                        'words_done': 0,
+                                        'words_to_be_done': 0,
+                                        'projects': 0
+                                    }
+
+                                data['workflow_by_language'][workflow_key]['words_done'] += step_total_words
+                                project_total_words += step_total_words
+
+                                # Aggregate user statistics
+                                user_lang_key = f"{username}||{target_lang_name}"
+                                if user_lang_key not in data['user_statistics']:
+                                    data['user_statistics'][user_lang_key] = {
+                                        'username': username,
+                                        'language': target_lang_name,
+                                        'workflow_steps': {}
+                                    }
+
+                                if clean_step_name not in data['user_statistics'][user_lang_key]['workflow_steps']:
+                                    data['user_statistics'][user_lang_key]['workflow_steps'][clean_step_name] = 0
+
+                                data['user_statistics'][user_lang_key]['workflow_steps'][clean_step_name] += step_total_words
+
+                # Only add project to stats if it has work in the target period
+                if project_has_work_in_period and project_total_words > 0:
+                    # Update project stats
+                    data['project_stats']['total'] += 1
+                    status = project.get('status', 'UNKNOWN')
+
+                    if status == 'FINISHED':
+                        data['project_stats']['completed'] += 1
+                    elif status in ['IN_PROGRESS', 'STARTED']:
+                        data['project_stats']['in_progress'] += 1
+                    else:
+                        data['project_stats']['pending'] += 1
+
+                    # Mark projects for each language/workflow combination
+                    for target_lang_name in target_languages:
+                        for step_name in set([s.get('workflowStepName', '') for lang_stat in stats_list for u in lang_stat.get('usersStatistics', []) for s in u.get('stepsStatistics', [])]):
+                            clean_step_name = ''.join([c for c in step_name if not c.isdigit()])
                             workflow_key = f"{clean_step_name} - {target_lang_name}"
+                            if workflow_key in data['workflow_by_language']:
+                                data['workflow_by_language'][workflow_key]['projects'] = data['workflow_by_language'][workflow_key].get('projects', 0) + 1
 
-                            if workflow_key not in data['workflow_by_language']:
-                                data['workflow_by_language'][workflow_key] = {
-                                    'workflow_step': clean_step_name,
-                                    'language': target_lang_name,
-                                    'words_done': 0,
-                                    'words_to_be_done': 0,
-                                    'projects': 0
-                                }
-
-                            data['workflow_by_language'][workflow_key]['words_done'] += step_total_words
-                            project_total_words += step_total_words
-
-                            # Aggregate user statistics
-                            user_lang_key = f"{username}||{target_lang_name}"
-                            if user_lang_key not in data['user_statistics']:
-                                data['user_statistics'][user_lang_key] = {
-                                    'username': username,
-                                    'language': target_lang_name,
-                                    'workflow_steps': {}
-                                }
-
-                            if clean_step_name not in data['user_statistics'][user_lang_key]['workflow_steps']:
-                                data['user_statistics'][user_lang_key]['workflow_steps'][clean_step_name] = 0
-
-                            data['user_statistics'][user_lang_key]['workflow_steps'][clean_step_name] += step_total_words
-
-                    # Mark this project as counted for this language
-                    for step_name in set([s.get('workflowStepName', '') for u in users_statistics for s in u.get('stepsStatistics', [])]):
-                        clean_step_name = ''.join([c for c in step_name if not c.isdigit()])
-                        workflow_key = f"{clean_step_name} - {target_lang_name}"
-                        if workflow_key in data['workflow_by_language']:
-                            data['workflow_by_language'][workflow_key]['projects'] = data['workflow_by_language'][workflow_key].get('projects', 0) + 1
-
-                # Store project summary
-                data['projects'].append({
-                    'id': project_id,
-                    'name': project.get('name', 'Unknown'),
-                    'status': status,
-                    'source_lang': source_lang,
-                    'target_langs': ', '.join(target_languages),
-                    'total_words': project_total_words,
-                    'created_date': readable_date
-                })
-            else:
-                # No metrics available, still add project
-                data['projects'].append({
-                    'id': project_id,
-                    'name': project.get('name', 'Unknown'),
-                    'status': status,
-                    'source_lang': 'unknown',
-                    'target_langs': 'N/A',
-                    'total_words': 0,
-                    'created_date': readable_date
-                })
+                    # Store project summary
+                    data['projects'].append({
+                        'id': project_id,
+                        'name': project.get('name', 'Unknown'),
+                        'status': status,
+                        'source_lang': source_lang,
+                        'target_langs': ', '.join(target_languages),
+                        'total_words': project_total_words,
+                        'created_date': None  # Filtering by finish date, not project creation
+                    })
 
         logger.info(f"Aggregated data for {data['project_stats']['total']} projects")
         return data
@@ -616,11 +817,60 @@ class XTMReportGenerator:
         if ytd_data.get('user_statistics'):
             self.create_user_statistics_sheet(wb, "User Statistics - YTD", ytd_data, f"User Statistics - YTD ({self.ytd_start_month} to {self.ytd_end_month})")
 
-        # Save workbook
-        wb.save(output_path)
-        logger.info(f"Excel report saved to {output_path}")
+        # Save workbook with fallback locations
+        save_successful = False
+        last_error = None
 
-        return output_path
+        # Try primary location
+        try:
+            wb.save(output_path)
+            logger.info(f"Excel report saved to {output_path}")
+            save_successful = True
+            return output_path
+        except Exception as e:
+            last_error = e
+            logger.warning(f"Failed to save to primary location {output_path}: {e}")
+
+        # Try fallback location 1: Desktop
+        if not save_successful:
+            try:
+                fallback_path = Path.home() / "Desktop" / Path(output_path).name
+                wb.save(str(fallback_path))
+                logger.info(f"Excel report saved to fallback location: {fallback_path}")
+                save_successful = True
+                return str(fallback_path)
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Failed to save to Desktop fallback: {e}")
+
+        # Try fallback location 2: Current working directory
+        if not save_successful:
+            try:
+                fallback_path = Path.cwd() / Path(output_path).name
+                wb.save(str(fallback_path))
+                logger.info(f"Excel report saved to fallback location: {fallback_path}")
+                save_successful = True
+                return str(fallback_path)
+            except Exception as e:
+                last_error = e
+                logger.warning(f"Failed to save to current directory fallback: {e}")
+
+        # Try fallback location 3: Temp directory
+        if not save_successful:
+            try:
+                import tempfile
+                fallback_path = Path(tempfile.gettempdir()) / Path(output_path).name
+                wb.save(str(fallback_path))
+                logger.info(f"Excel report saved to temp directory fallback: {fallback_path}")
+                save_successful = True
+                return str(fallback_path)
+            except Exception as e:
+                last_error = e
+                logger.error(f"Failed to save to temp directory fallback: {e}")
+
+        # If all save attempts failed, raise the last error
+        if not save_successful:
+            raise Exception(f"Failed to save Excel report to any location. Last error: {last_error}")
 
     def _calculate_summary_stats(self, data: Dict) -> Dict:
         """Calculate summary statistics from the data."""
@@ -664,6 +914,86 @@ class XTMReportGenerator:
         stats['workflow_summary'] = '\n'.join(workflow_text) if workflow_text else "No data available"
 
         return stats
+
+    def _send_system_notification(self, title: str, message: str, sound: bool = True):
+        """Send a macOS system notification."""
+        try:
+            script = f'''
+            display notification "{message}" with title "{title}"'''
+            if sound:
+                script += ' sound name "Glass"'
+
+            subprocess.run(
+                ['osascript', '-e', script],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            logger.info(f"System notification sent: {title}")
+        except Exception as e:
+            logger.warning(f"Could not send system notification: {e}")
+
+    def _send_failure_notification(self, error_message: str, report_path: str = None):
+        """Send notification about failure via multiple channels."""
+        logger.info("Sending failure notifications")
+
+        # 1. Send macOS system notification
+        self._send_system_notification(
+            "XTM Report Failed",
+            f"Report generation encountered an error. Check logs for details.",
+            sound=True
+        )
+
+        # 2. Try to send email notification
+        try:
+            subject = f"ALERT: XTM Monthly Report Failed - {self.report_month}"
+            body = f"""ALERT: The automated XTM monthly report generation has failed.
+
+Report Period: {self.report_month_name}
+Time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
+Error: {error_message}
+
+Please check the log file at:
+{Path.cwd() / 'xtm_report.log'}
+"""
+            if report_path:
+                body += f"\nPartial report may be available at: {report_path}"
+
+            body += "\n\nPlease investigate and re-run manually if needed."
+
+            # Escape for AppleScript
+            subject_escaped = subject.replace('\\', '\\\\').replace('"', '\\"')
+            body_escaped = body.replace('\\', '\\\\').replace('"', '\\"')
+
+            recipients = self.config.get('email_recipients', [])
+            if recipients:
+                # Try simple notification email via Mail app
+                recipients_script = ""
+                for recipient in recipients:
+                    recipient_escaped = recipient.replace('\\', '\\\\').replace('"', '\\"')
+                    recipients_script += f'make new to recipient at end of to recipients of new_message with properties {{address:"{recipient_escaped}"}}\n'
+
+                applescript = f'''
+                tell application "Mail"
+                    set new_message to make new outgoing message with properties {{subject:"{subject_escaped}", visible:false}}
+                    tell new_message
+                        {recipients_script}
+                        set the content to "{body_escaped}"
+                    end tell
+                    send new_message
+                end tell
+                '''
+
+                subprocess.run(
+                    ['osascript', '-e', applescript],
+                    capture_output=True,
+                    text=True,
+                    timeout=30
+                )
+                logger.info("Failure notification email sent")
+        except Exception as e:
+            logger.warning(f"Could not send failure email notification: {e}")
 
     def _ensure_outlook_running(self) -> bool:
         """Ensure Microsoft Outlook is running, launch if needed."""
@@ -913,39 +1243,86 @@ Best regards
 
     def generate_report(self):
         """Main method to generate and distribute the report."""
+        report_path = None
         try:
             logger.info("Starting XTM monthly report generation")
 
+            # Run health checks
+            self._run_health_checks()
+
             # Aggregate monthly data
-            monthly_data = self.aggregate_monthly_data(self.report_month, self.report_month)
+            try:
+                monthly_data = self.aggregate_monthly_data(self.report_month, self.report_month)
+            except Exception as e:
+                logger.error(f"Failed to aggregate monthly data: {e}", exc_info=True)
+                # Initialize with empty data structure
+                monthly_data = {
+                    'project_stats': {'total': 0, 'completed': 0, 'in_progress': 0, 'pending': 0},
+                    'workflow_by_language': {},
+                    'user_statistics': {},
+                    'projects': []
+                }
 
             # Aggregate year-to-date data
-            ytd_data = self.aggregate_monthly_data(self.ytd_start_month, self.ytd_end_month)
+            try:
+                ytd_data = self.aggregate_monthly_data(self.ytd_start_month, self.ytd_end_month)
+            except Exception as e:
+                logger.error(f"Failed to aggregate YTD data: {e}", exc_info=True)
+                # Use monthly data as fallback
+                ytd_data = monthly_data
+
+            # Validate we have at least some data
+            has_data = (monthly_data.get('workflow_by_language') or
+                       ytd_data.get('workflow_by_language'))
+
+            if not has_data:
+                logger.warning("No data available for reporting period")
 
             # Create output filename
             output_filename = f"XTM_Monthly_Report_{self.report_month}_{self.report_date.strftime('%Y%m%d')}.xlsx"
             output_path = Path(self.config['onedrive_path']) / output_filename
 
-            # Ensure output directory exists
-            output_path.parent.mkdir(parents=True, exist_ok=True)
+            # Ensure output directory exists (but don't fail if we can't create it)
+            try:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+            except Exception as e:
+                logger.warning(f"Could not create output directory: {e}")
 
             # Create Excel report
-            report_path = self.create_excel_report(monthly_data, ytd_data, str(output_path))
+            try:
+                report_path = self.create_excel_report(monthly_data, ytd_data, str(output_path))
+            except Exception as e:
+                logger.error(f"Failed to create Excel report: {e}", exc_info=True)
+                raise
 
             # Send via Outlook (pass the data for email body)
-            self.send_email_via_outlook(report_path, monthly_data, ytd_data)
+            # Don't fail the entire process if email fails
+            try:
+                self.send_email_via_outlook(report_path, monthly_data, ytd_data)
+                email_success = True
+            except Exception as e:
+                logger.error(f"Failed to send email: {e}", exc_info=True)
+                email_success = False
 
             logger.info("Report generation completed successfully")
             print(f"\n✓ Report generated: {report_path}")
             print(f"✓ Monthly period: {self.report_month_name}")
             print(f"✓ YTD period: {self.ytd_start_month} to {self.ytd_end_month}")
-            if self.auto_send:
-                print(f"✓ Email sent automatically to {len(self.config['email_recipients'])} recipients")
+            if email_success:
+                if self.auto_send:
+                    print(f"✓ Email sent automatically to {len(self.config['email_recipients'])} recipients")
+                else:
+                    print(f"✓ Email draft created with {len(self.config['email_recipients'])} recipients")
             else:
-                print(f"✓ Email draft created with {len(self.config['email_recipients'])} recipients")
+                print(f"⚠ Email could not be sent - report saved locally")
 
         except Exception as e:
             logger.error(f"Report generation failed: {e}", exc_info=True)
+            # Send failure notification
+            try:
+                self._send_failure_notification(str(e), report_path)
+            except:
+                pass
             raise
 
 
