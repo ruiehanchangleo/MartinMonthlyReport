@@ -97,6 +97,7 @@ class XTMReportGenerator:
 
     # Locale code to language name mapping
     LOCALE_TO_LANGUAGE = {
+        'en_US': 'English (USA)',
         'ar_AE': 'Arabic (UAE)',
         'ar_EG': 'Arabic (Egypt)',
         'ar_SA': 'Arabic (Saudi Arabia)',
@@ -115,7 +116,7 @@ class XTMReportGenerator:
         'fa_IR': 'Persian',
         'fi_FI': 'Finnish',
         'fj_FJ': 'Fijian',
-        'fr_FR': 'French',
+        'fr_FR': 'French (France)',
         'hr_BA': 'Croatian (Bosnia)',
         'hr_HR': 'Croatian',
         'ht_HT': 'Haitian Creole',
@@ -360,6 +361,36 @@ class XTMReportGenerator:
             logger.warning(f"Failed to get metrics for project {project_id}: {e}")
             return []
 
+    def get_project_metrics_data(self, project_id: int):
+        """
+        Get project metrics showing wordsDone for each workflow step.
+        Returns metrics for all languages in the project with wordsDone by workflow step.
+        This shows CURRENT progress, not historical monthly completions.
+        """
+        try:
+            metrics = self._make_request(f'projects/{project_id}/metrics')
+            if not isinstance(metrics, list):
+                return []
+            return metrics
+        except Exception as e:
+            logger.warning(f"Failed to get metrics for project {project_id}: {e}")
+            return []
+
+    def get_project_status_with_steps(self, project_id: int):
+        """
+        Get project status with workflow step completion dates.
+        This endpoint preserves finishDate even when work is reopened.
+        Returns job-level data with step-level finish dates.
+        """
+        try:
+            status = self._make_request(f'projects/{project_id}/status?fetchLevel=STEPS')
+            if not isinstance(status, dict):
+                return {}
+            return status
+        except Exception as e:
+            logger.warning(f"Failed to get status for project {project_id}: {e}")
+            return {}
+
     def get_project_statistics(self, project_id: int, excluded_users: List[str] = None):
         """Get detailed per-user statistics for a project, excluding specified users."""
         if excluded_users is None:
@@ -418,13 +449,32 @@ class XTMReportGenerator:
             return []
 
     def aggregate_monthly_data(self, start_month: str = None, end_month: str = None) -> Dict:
-        """Aggregate data for the specified date range."""
+        """Aggregate data for the specified date range using completion dates."""
         if start_month is None:
             start_month = self.report_month
         if end_month is None:
             end_month = self.report_month
 
         logger.info(f"Aggregating data from {start_month} to {end_month}")
+
+        # Parse date range
+        from datetime import datetime
+        start_date = datetime.strptime(start_month + '-01', '%Y-%m-%d')
+        # End date is last day of end_month
+        if end_month != start_month:
+            end_year, end_month_num = map(int, end_month.split('-'))
+            if end_month_num == 12:
+                end_date = datetime(end_year + 1, 1, 1)
+            else:
+                end_date = datetime(end_year, end_month_num + 1, 1)
+        else:
+            year, month = map(int, start_month.split('-'))
+            if month == 12:
+                end_date = datetime(year + 1, 1, 1)
+            else:
+                end_date = datetime(year, month + 1, 1)
+
+        logger.info(f"Date range: {start_date} to {end_date}")
 
         # Initialize data structures
         data = {
@@ -434,7 +484,7 @@ class XTMReportGenerator:
                 'in_progress': 0,
                 'pending': 0
             },
-            'workflow_by_language': {},  # New: workflow metrics per language
+            'workflow_by_language': {},  # workflow metrics per language
             'user_statistics': {},  # User-level statistics
             'projects': []
         }
@@ -447,125 +497,125 @@ class XTMReportGenerator:
             if not project_id:
                 continue
 
-            # Get project statistics (filtered to exclude specified users)
-            # Wrap in try-except to continue even if individual projects fail
+            # Get project statistics with user and job details
+            # Excluded users are filtered out by default
             try:
                 stats_list = self.get_project_statistics(project_id)
+                # Get project status with step-level completion dates
+                # This preserves finishDate even when work is reopened
+                project_status = self.get_project_status_with_steps(project_id)
             except Exception as e:
-                logger.warning(f"Failed to get statistics for project {project_id}, skipping: {e}")
+                logger.warning(f"Failed to get data for project {project_id}, skipping: {e}")
                 continue
 
-            # Process each target language in the statistics
+            # Build a map of completion dates from /status: {jobId: {stepName: finishDate}}
+            # These finishDate values are preserved even when work is reopened
+            # Use lowercase step names as keys to handle case mismatches between endpoints
+            job_step_dates = {}
+            if project_status:
+                for job in project_status.get('jobs', []):
+                    job_id = job.get('jobId')
+                    if job_id:
+                        job_step_dates[job_id] = {}
+                        for step in job.get('steps', []):
+                            step_name = step.get('workflowStepName', '')
+                            finish_date = step.get('finishDate')
+                            if finish_date and step_name:
+                                # Store with lowercase key for case-insensitive lookup
+                                job_step_dates[job_id][step_name.lower()] = finish_date
+
+            # Process each target language
             if isinstance(stats_list, list) and stats_list:
                 project_total_words = 0
                 project_has_work_in_period = False
                 target_languages = []
-                source_lang = 'en_US'  # Default, will try to determine from context
+                source_lang = 'en_US'  # Default
 
                 for lang_stats in stats_list:
                     target_lang_code = lang_stats.get('targetLanguage', 'unknown')
                     target_lang_name = self._locale_to_language_name(target_lang_code)
 
-                    # Aggregate words from all users (already filtered to exclude specified users)
                     users_statistics = lang_stats.get('usersStatistics', [])
 
-                    for user_stats in users_statistics:
-                        username = user_stats.get('username', 'Unknown')
-                        steps_statistics = user_stats.get('stepsStatistics', [])
+                    # Process each user's work (already filtered by get_project_statistics)
+                    for user_stat in users_statistics:
+                        steps_statistics = user_stat.get('stepsStatistics', [])
 
+                        # Process each workflow step
                         for step_stat in steps_statistics:
                             step_name = step_stat.get('workflowStepName', '')
-                            # Remove numbers from step name (e.g., "translate1" -> "translate")
+                            # Remove numbers from step name
                             clean_step_name = ''.join([c for c in step_name if not c.isdigit()])
 
-                            # Get total words from all jobs for this user/step/language
                             jobs_statistics = step_stat.get('jobsStatistics', [])
-                            step_total_words = 0
 
+                            # Process each job - FILTER BY STEP COMPLETION DATE
                             for job_stat in jobs_statistics:
-                                # Filter by finish date (lastCompletionDate)
-                                # If blank, ignore this job
-                                last_completion_date = job_stat.get('lastCompletionDate')
-                                completion_month = None
+                                include_this_job = False
 
-                                if last_completion_date:
-                                    try:
-                                        if isinstance(last_completion_date, (int, float)):
-                                            dt = datetime.fromtimestamp(last_completion_date / 1000)
-                                            completion_month = dt.strftime('%Y-%m')
-                                    except:
-                                        pass
+                                # Get job ID to look up step finish date from /status
+                                job_id = job_stat.get('jobId')
 
-                                # Skip work not completed in the target date range
-                                if completion_month:
-                                    if completion_month < start_month or completion_month > end_month:
-                                        continue
-                                else:
-                                    # If no completion date, skip this job
-                                    continue
+                                # Get the finish date for this specific step from /status endpoint
+                                # This date is preserved even when work is reopened
+                                # Use lowercase for case-insensitive lookup
+                                finish_date_ts = None
+                                if job_id and job_id in job_step_dates:
+                                    finish_date_ts = job_step_dates[job_id].get(step_name.lower())
 
-                                # Calculate total words using all match type fields:
-                                # iceMatchWords + leveragedWords + repeatsWords + machineTranslationWords +
-                                # highFuzzyMatchWords + mediumFuzzyMatchWords + lowFuzzyMatchWords +
-                                # highFuzzyRepeatsWords + mediumFuzzyRepeatsWords + lowFuzzyRepeatsWords +
-                                # noMatchingWords
-                                source_stats = job_stat.get('sourceStatistics', {})
-                                ice_match_words = source_stats.get('iceMatchWords', 0)
-                                leveraged_words = source_stats.get('leveragedWords', 0)
-                                repeats_words = source_stats.get('repeatsWords', 0)
-                                machine_translation_words = source_stats.get('machineTranslationWords', 0)
-                                high_fuzzy_match_words = source_stats.get('highFuzzyMatchWords', 0)
-                                medium_fuzzy_match_words = source_stats.get('mediumFuzzyMatchWords', 0)
-                                low_fuzzy_match_words = source_stats.get('lowFuzzyMatchWords', 0)
-                                high_fuzzy_repeats_words = source_stats.get('highFuzzyRepeatsWords', 0)
-                                medium_fuzzy_repeats_words = source_stats.get('mediumFuzzyRepeatsWords', 0)
-                                low_fuzzy_repeats_words = source_stats.get('lowFuzzyRepeatsWords', 0)
-                                no_matching_words = source_stats.get('noMatchingWords', 0)
+                                # Check if this step was completed in the target date range
+                                if finish_date_ts:
+                                    completion_date = datetime.fromtimestamp(finish_date_ts / 1000)
+                                    if start_date <= completion_date < end_date:
+                                        include_this_job = True
+                                        logger.debug(f"Including job {job_id} step {step_name}: completed {completion_date}")
 
-                                job_words = (ice_match_words + leveraged_words + repeats_words + machine_translation_words +
-                                           high_fuzzy_match_words + medium_fuzzy_match_words + low_fuzzy_match_words +
-                                           high_fuzzy_repeats_words + medium_fuzzy_repeats_words + low_fuzzy_repeats_words +
-                                           no_matching_words)
-                                step_total_words += job_words
+                                if include_this_job:
+                                    # This job should be included!
+                                    source_stats = job_stat.get('sourceStatistics', {})
+                                    total_words = source_stats.get('totalWords', 0)
 
-                            # Mark that this project has work
-                            if step_total_words > 0:
-                                project_has_work_in_period = True
+                                    if total_words > 0:
+                                        project_has_work_in_period = True
 
-                            # Only aggregate if this step had words in the target period
-                            if step_total_words > 0:
-                                # Add language to list if not already there
-                                if target_lang_name not in target_languages:
-                                    target_languages.append(target_lang_name)
+                                        if target_lang_name not in target_languages:
+                                            target_languages.append(target_lang_name)
 
-                                # Create unique key for workflow step + language (using language name)
-                                workflow_key = f"{clean_step_name} - {target_lang_name}"
+                                        # Get username for user statistics
+                                        username = user_stat.get('userDisplayName', user_stat.get('username', 'Unknown'))
+                                        # Reverse name format from "LastName FirstName" to "FirstName LastName"
+                                        if username and ' ' in username:
+                                            parts = username.rsplit(' ', 1)
+                                            username = f"{parts[1]} {parts[0]}"
 
-                                if workflow_key not in data['workflow_by_language']:
-                                    data['workflow_by_language'][workflow_key] = {
-                                        'workflow_step': clean_step_name,
-                                        'language': target_lang_name,
-                                        'words_done': 0,
-                                        'words_to_be_done': 0,
-                                        'projects': 0
-                                    }
+                                        # Track user statistics (user + language + workflow step)
+                                        user_key = f"{username}|{target_lang_name}"
+                                        if user_key not in data['user_statistics']:
+                                            data['user_statistics'][user_key] = {
+                                                'username': username,
+                                                'language': target_lang_name,
+                                                'workflow_steps': {}
+                                            }
 
-                                data['workflow_by_language'][workflow_key]['words_done'] += step_total_words
-                                project_total_words += step_total_words
+                                        # Add words to this user's workflow step
+                                        if clean_step_name not in data['user_statistics'][user_key]['workflow_steps']:
+                                            data['user_statistics'][user_key]['workflow_steps'][clean_step_name] = 0
+                                        data['user_statistics'][user_key]['workflow_steps'][clean_step_name] += total_words
 
-                                # Aggregate user statistics
-                                user_lang_key = f"{username}||{target_lang_name}"
-                                if user_lang_key not in data['user_statistics']:
-                                    data['user_statistics'][user_lang_key] = {
-                                        'username': username,
-                                        'language': target_lang_name,
-                                        'workflow_steps': {}
-                                    }
+                                        # Create unique key for workflow step + language
+                                        workflow_key = f"{clean_step_name} - {target_lang_name}"
 
-                                if clean_step_name not in data['user_statistics'][user_lang_key]['workflow_steps']:
-                                    data['user_statistics'][user_lang_key]['workflow_steps'][clean_step_name] = 0
+                                        if workflow_key not in data['workflow_by_language']:
+                                            data['workflow_by_language'][workflow_key] = {
+                                                'workflow_step': clean_step_name,
+                                                'language': target_lang_name,
+                                                'words_done': 0,
+                                                'words_to_be_done': 0,
+                                                'projects': 0
+                                            }
 
-                                data['user_statistics'][user_lang_key]['workflow_steps'][clean_step_name] += step_total_words
+                                        data['workflow_by_language'][workflow_key]['words_done'] += total_words
+                                        project_total_words += total_words
 
                 # Only add project to stats if it has work in the target period
                 if project_has_work_in_period and project_total_words > 0:
@@ -582,10 +632,9 @@ class XTMReportGenerator:
 
                     # Mark projects for each language/workflow combination
                     for target_lang_name in target_languages:
-                        for step_name in set([s.get('workflowStepName', '') for lang_stat in stats_list for u in lang_stat.get('usersStatistics', []) for s in u.get('stepsStatistics', [])]):
-                            clean_step_name = ''.join([c for c in step_name if not c.isdigit()])
-                            workflow_key = f"{clean_step_name} - {target_lang_name}"
-                            if workflow_key in data['workflow_by_language']:
+                        for workflow_key in data['workflow_by_language'].keys():
+                            # Check if this workflow_key matches this language
+                            if workflow_key.endswith(f" - {target_lang_name}"):
                                 data['workflow_by_language'][workflow_key]['projects'] = data['workflow_by_language'][workflow_key].get('projects', 0) + 1
 
                     # Store project summary
@@ -804,14 +853,14 @@ class XTMReportGenerator:
         wb = Workbook()
 
         # Create Monthly sheet
-        self.create_workflow_sheet(wb, "Monthly", monthly_data, f"Monthly Report - {self.report_month_name}")
+        self.create_workflow_sheet(wb, "Monthly", monthly_data, f"Current Progress Report - {self.report_month_name}")
 
-        # Create Monthly User Statistics sheet
+        # Create Monthly User Statistics sheet (Note: Not available with metrics endpoint)
         if monthly_data.get('user_statistics'):
             self.create_user_statistics_sheet(wb, "User Statistics - Monthly", monthly_data, f"User Statistics - {self.report_month_name}")
 
         # Create YTD sheet
-        self.create_workflow_sheet(wb, "Year-to-Date", ytd_data, f"Year-to-Date Report - {self.ytd_start_month} to {self.ytd_end_month}")
+        self.create_workflow_sheet(wb, "Year-to-Date", ytd_data, f"Year-to-Date Progress - {self.ytd_start_month} to {self.ytd_end_month}")
 
         # Create YTD User Statistics sheet
         if ytd_data.get('user_statistics'):

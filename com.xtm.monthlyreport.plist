@@ -14,11 +14,9 @@
     <key>WorkingDirectory</key>
     <string>/Users/jayjay5032/Desktop/MartinMonthlyReport</string>
 
-    <!-- Run on the 1st of every month at 9:00 AM -->
+    <!-- Run daily at 9:00 AM (TESTING MODE) -->
     <key>StartCalendarInterval</key>
     <dict>
-        <key>Day</key>
-        <integer>1</integer>
         <key>Hour</key>
         <integer>9</integer>
         <key>Minute</key>
