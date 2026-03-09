@@ -21,6 +21,31 @@ echo "======================================" >> "$LOG_FILE"
 echo "Starting XTM report generation at $(date)" >> "$LOG_FILE"
 echo "======================================" >> "$LOG_FILE"
 
+# Self-healing: Clear LaunchAgent error state if present
+clear_error_state() {
+    local plist_path="$HOME/Library/LaunchAgents/com.xtm.monthlyreport.plist"
+
+    # Check if the LaunchAgent has a failed exit code
+    if launchctl list com.xtm.monthlyreport &>/dev/null; then
+        local exit_status=$(launchctl list com.xtm.monthlyreport 2>/dev/null | grep "LastExitStatus" | awk '{print $3}' | tr -d ';')
+
+        # If exit status is non-zero and non-empty, clear the error state
+        if [ -n "$exit_status" ] && [ "$exit_status" != "0" ]; then
+            echo "⚠ Detected LaunchAgent error state (exit code: $exit_status). Clearing..." >> "$LOG_FILE"
+
+            # Unload and reload to clear the error state
+            launchctl unload "$plist_path" 2>/dev/null || true
+            sleep 1
+            launchctl load "$plist_path" 2>/dev/null || true
+
+            echo "✓ LaunchAgent error state cleared" >> "$LOG_FILE"
+        fi
+    fi
+}
+
+# Clear any error state before starting
+clear_error_state
+
 # Function to run the report
 run_report() {
     python3 "$PYTHON_SCRIPT" --auto-send
