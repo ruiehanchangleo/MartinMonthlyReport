@@ -7,16 +7,18 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>/Users/jayjay5032/Desktop/MartinMonthlyReport/run_report_with_retry.sh</string>
+        <string>/usr/bin/python3</string>
+        <string>/Users/jayjay5032/MartinMonthlyReport/generate_report.py</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/jayjay5032/Desktop/MartinMonthlyReport</string>
+    <string>/Users/jayjay5032/MartinMonthlyReport</string>
 
-    <!-- Run daily at 9:00 AM (TESTING MODE) -->
+    <!-- Run on the 1st of every month at 9:00 AM -->
     <key>StartCalendarInterval</key>
     <dict>
+        <key>Day</key>
+        <integer>1</integer>
         <key>Hour</key>
         <integer>9</integer>
         <key>Minute</key>
@@ -24,10 +26,10 @@
     </dict>
 
     <key>StandardOutPath</key>
-    <string>/Users/jayjay5032/Desktop/MartinMonthlyReport/xtm_report.log</string>
+    <string>/Users/jayjay5032/MartinMonthlyReport/xtm_report.log</string>
 
     <key>StandardErrorPath</key>
-    <string>/Users/jayjay5032/Desktop/MartinMonthlyReport/xtm_report_error.log</string>
+    <string>/Users/jayjay5032/MartinMonthlyReport/xtm_report_error.log</string>
 
     <!-- Run even when user is not logged in -->
     <key>RunAtLoad</key>

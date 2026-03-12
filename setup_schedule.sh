@@ -14,8 +14,12 @@ mkdir -p "$LAUNCH_AGENTS_DIR"
 # Copy the plist file
 cp "$PLIST_FILE" "$LAUNCH_AGENTS_DIR/"
 
+# Clear extended attributes that can block launchd execution
+xattr -c "$LAUNCH_AGENTS_DIR/$PLIST_FILE" 2>/dev/null || true
+
 # Load the LaunchAgent
 launchctl unload "$LAUNCH_AGENTS_DIR/$PLIST_FILE" 2>/dev/null
+sleep 1
 launchctl load "$LAUNCH_AGENTS_DIR/$PLIST_FILE"
 
 echo ""
