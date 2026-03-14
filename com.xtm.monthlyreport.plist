@@ -9,6 +9,7 @@
     <array>
         <string>/usr/bin/python3</string>
         <string>/Users/jayjay5032/MartinMonthlyReport/generate_report.py</string>
+        <string>--auto-send</string>
     </array>
 
     <key>WorkingDirectory</key>
