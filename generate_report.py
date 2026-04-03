@@ -149,6 +149,7 @@ class XTMReportGenerator:
         'sv_SE': 'Swedish',
         'sw_KE': 'Swahili (Kenya)',
         'sw_TZ': 'Swahili (Tanzania)',
+        'swa': 'Swahili',
         'th_TH': 'Thai',
         'tl_PH': 'Tagalog',
         'to_TO': 'Tongan',
@@ -222,8 +223,12 @@ class XTMReportGenerator:
             raise
 
     def _locale_to_language_name(self, locale_code: str) -> str:
-        """Convert locale code to language name."""
-        return self.LOCALE_TO_LANGUAGE.get(locale_code, locale_code)
+        """Convert locale code to base language name, combining variants."""
+        name = self.LOCALE_TO_LANGUAGE.get(locale_code, locale_code)
+        # Strip parenthetical variants: "Portuguese (Brazil)" -> "Portuguese"
+        if '(' in name:
+            name = name.split('(')[0].strip()
+        return name
 
     def _run_health_checks(self) -> bool:
         """Run comprehensive health checks before starting report generation."""
