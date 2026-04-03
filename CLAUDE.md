@@ -68,7 +68,7 @@ The automation includes multiple layers of error handling to ensure it never fai
 
 **Per-User Statistics API**: Uses `/projects/{id}/statistics` endpoint (not `/metrics`) to retrieve word counts broken down by user and workflow step. This enables filtering out specific users' work.
 
-**Excluded Users**: By default, work from `leo.chang@familysearch.org` and `LeoAdmin` is excluded from all reports. This is handled in `get_project_statistics()` by filtering the `usersStatistics` array before aggregation.
+**Excluded Users**: By default, work from `leo.chang@familysearch.org`, `LeoAdmin`, `Robert.Sena@churchofjesuschrist.org`, `MartinADMIN`, and `Tester BSP BSP` is excluded from all reports. This is handled in `get_project_statistics()` by filtering the `usersStatistics` array before aggregation.
 
 **Locale Translation**: All locale codes (e.g., `es_ES`, `zh_TW`) are converted to readable language names (e.g., "Spanish", "Chinese (Traditional)") using the `LOCALE_TO_LANGUAGE` dictionary (66 mappings). This happens during data aggregation via `_locale_to_language_name()`.
 
@@ -80,7 +80,9 @@ The automation includes multiple layers of error handling to ensure it never fai
 
 - `get_project_statistics(project_id, excluded_users)`: Fetches per-user statistics and filters out excluded users
 - `aggregate_monthly_data(start_month, end_month)`: Aggregates all project data for the reporting period, summing words from filtered users
+- `aggregate_monthly_breakdown(start_month, end_month)`: Aggregates data month-by-month for YTD line charts (returns monthly breakdown structure)
 - `create_workflow_sheet(wb, sheet_name, data, title)`: Creates Excel sheet with AutoFilter enabled, custom column ordering, and bar charts
+- `create_ytd_monthly_breakdown_sheet(wb, sheet_name, monthly_breakdown, title)`: Creates YTD sheet with monthly columns and line charts showing trends
 - `send_email_via_outlook(report_path, monthly_data, ytd_data)`: Handles email via Outlook with automatic launching and fallback to Apple Mail
 - `_ensure_outlook_running()`: Launches Outlook if not running (for --auto-send mode)
 
@@ -91,26 +93,33 @@ The automation includes multiple layers of error handling to ensure it never fai
 3. Filter out excluded users from `usersStatistics` array
 4. Aggregate word counts by language and workflow step
 5. Convert locale codes to language names
-6. Generate Excel with two sheets: Monthly and Year-to-Date
+6. Generate Excel with multiple sheets:
+   - Monthly: Current month summary with bar charts
+   - Year-to-Date: Monthly breakdown with line charts showing trends
+   - User Statistics sheets (if available)
 7. Enable AutoFilter on all data sheets
-8. Add bar charts showing total words per language
+8. Add charts: bar charts for monthly totals, line charts for YTD trends
 9. Launch Outlook (if needed) and create/send email
 
 ### Excel Report Structure
 
-**Two Sheets Generated:**
+**Sheets Generated:**
 
 1. **Monthly**: Current month data (e.g., "2026-01")
-2. **Year-to-Date**: Cumulative data from January to current month
+   - Column headers: Language, translate, correct, final review, Total
+   - Data rows sorted by total words (descending)
+   - AutoFilter enabled on all columns (for sorting/filtering)
+   - Bar chart showing total words per language
 
-**Each Sheet Contains:**
+2. **Year-to-Date**: Monthly breakdown from January to current month
+   - Column headers: Language, Month1, Month2, ..., Total
+   - Shows words processed per language per month
+   - Data rows sorted by total words (descending)
+   - AutoFilter enabled on all columns (for sorting/filtering)
+   - Line charts showing monthly trends for top 10 languages
 
-- Title rows with period information
-- Column headers: Language, translate, correct, final review, Total
-- Data rows sorted by total words (descending)
-- AutoFilter enabled on all columns (for sorting/filtering)
-- Bar chart showing total words per language
-- Summary row at bottom with totals
+3. **User Statistics - Monthly**: Per-user breakdown for current month (if available)
+4. **User Statistics - YTD**: Per-user cumulative totals for year-to-date (if available)
 
 ### Email Automation (macOS)
 
@@ -148,7 +157,7 @@ To modify excluded users, update the default parameter in `get_project_statistic
 ```python
 def get_project_statistics(self, project_id: int, excluded_users: List[str] = None):
     if excluded_users is None:
-        excluded_users = ["leo.chang@familysearch.org", "LeoAdmin"]
+        excluded_users = ["leo.chang@familysearch.org", "LeoAdmin", "Robert.Sena@churchofjesuschrist.org", "MartinADMIN", "Tester BSP BSP"]
 ```
 
 The exclusion is case-insensitive.
