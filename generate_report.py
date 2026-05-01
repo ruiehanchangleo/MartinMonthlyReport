@@ -163,12 +163,21 @@ class XTMReportGenerator:
         'zh_TW': 'Chinese (Traditional)',
     }
 
-    # Users excluded from all reports (checked case-insensitively against all name fields)
+    # Email domains to exclude (all users from these domains are filtered out)
+    EXCLUDED_DOMAINS = [
+        "familysearch.org",
+        "churchofjesuschrist.org",
+        "brightspot.com",
+        "xtm-intl.com"
+    ]
+
+    # Additional specific users to exclude (non-email usernames)
     EXCLUDED_USERS = [
-        "leo.chang@familysearch.org", "LeoAdmin",
-        "Robert.Sena@churchofjesuschrist.org", "MartinADMIN",
-        "Tester BSP BSP", "BSP BSP Tester", "BSP_Tester",
-        "ben.randall@brightspot.com"
+        "LeoAdmin",
+        "MartinADMIN",
+        "Tester BSP BSP",
+        "BSP BSP Tester",
+        "BSP_Tester"
     ]
 
     def __init__(self, config_path: str = "xtm_config.json", auto_send: bool = False):
@@ -402,26 +411,35 @@ class XTMReportGenerator:
             return {}
 
     def _is_excluded_user(self, user_stat: Dict) -> bool:
-        """Check if a user should be excluded, matching against all name fields."""
+        """Check if a user should be excluded based on email domain or specific username."""
+        username = user_stat.get('username', '').lower()
+        display_name = user_stat.get('userDisplayName', '').lower()
+
+        # Check if username (email) ends with any excluded domain
+        for domain in self.EXCLUDED_DOMAINS:
+            if username.endswith(f"@{domain.lower()}"):
+                return True
+
+        # Check against specific excluded usernames
         excluded_lower = [u.lower() for u in self.EXCLUDED_USERS]
 
         # Check all possible name fields
         fields_to_check = [
-            user_stat.get('username', ''),
-            user_stat.get('userDisplayName', ''),
+            username,
+            display_name,
         ]
 
         # Also check firstName + lastName combination
         first_name = user_stat.get('firstName', '').strip()
         last_name = user_stat.get('lastName', '').strip()
         if first_name and last_name:
-            fields_to_check.append(f"{first_name} {last_name}")
+            fields_to_check.append(f"{first_name} {last_name}".lower())
         if first_name:
-            fields_to_check.append(first_name)
+            fields_to_check.append(first_name.lower())
         if last_name:
-            fields_to_check.append(last_name)
+            fields_to_check.append(last_name.lower())
 
-        return any(field.lower() in excluded_lower for field in fields_to_check if field)
+        return any(field in excluded_lower for field in fields_to_check if field)
 
     @staticmethod
     def _resolve_user_name(user_stat: Dict) -> str:
@@ -903,6 +921,374 @@ class XTMReportGenerator:
         plt.close(fig)
         buf.seek(0)
         return base64.b64encode(buf.read()).decode('utf-8')
+
+    def create_excel_report(self, monthly_data: Dict, ytd_monthly_breakdown: Dict, output_path: str) -> str:
+        """Create an Excel report with monthly and YTD data."""
+        from openpyxl import Workbook
+        from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+        from openpyxl.utils import get_column_letter
+        from openpyxl.chart import BarChart, LineChart, Reference
+
+        logger.info(f"Creating Excel report at {output_path}")
+
+        wb = Workbook()
+        wb.remove(wb.active)  # Remove default sheet
+
+        # === MONTHLY SHEET ===
+        self._create_monthly_sheet(wb, monthly_data)
+
+        # === YTD SHEET ===
+        self._create_ytd_sheet(wb, ytd_monthly_breakdown)
+
+        # === USER STATISTICS SHEETS ===
+        self._create_user_monthly_sheet(wb, monthly_data)
+        self._create_user_ytd_sheet(wb, ytd_monthly_breakdown)
+
+        # Save workbook
+        wb.save(output_path)
+        logger.info(f"Excel report saved to {output_path}")
+        return output_path
+
+    def _create_monthly_sheet(self, wb: 'Workbook', monthly_data: Dict):
+        """Create the monthly data sheet with workflow breakdown."""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.chart import BarChart, Reference
+
+        ws = wb.create_sheet(f"Monthly - {self.report_month}")
+
+        # Extract data
+        workflow_by_language = monthly_data.get('workflow_by_language', {})
+
+        # Organize by language
+        monthly_languages = {}
+        for workflow_key, metrics in workflow_by_language.items():
+            language = metrics['language']
+            workflow_step = metrics['workflow_step']
+            words = metrics['words_done']
+
+            if language not in monthly_languages:
+                monthly_languages[language] = {}
+            monthly_languages[language][workflow_step] = words
+
+        # Get all workflow steps
+        all_steps = set()
+        for lang_steps in monthly_languages.values():
+            all_steps.update(lang_steps.keys())
+        workflow_steps = sorted(all_steps, key=lambda x: ['translate', 'correct', 'final review'].index(x) if x in ['translate', 'correct', 'final review'] else 999)
+
+        # Calculate totals
+        monthly_language_totals = {lang: sum(steps.values()) for lang, steps in monthly_languages.items()}
+
+        # Write headers
+        headers = ['Language'] + workflow_steps + ['Total']
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+            cell.alignment = Alignment(horizontal='center')
+
+        # Write data rows
+        sorted_languages = sorted(monthly_language_totals.keys(), key=lambda x: monthly_language_totals[x], reverse=True)
+        for row_idx, language in enumerate(sorted_languages, 2):
+            ws.cell(row=row_idx, column=1, value=language)
+
+            for col_idx, step in enumerate(workflow_steps, 2):
+                words = monthly_languages[language].get(step, 0)
+                cell = ws.cell(row=row_idx, column=col_idx, value=words)
+                cell.number_format = '#,##0'
+                cell.alignment = Alignment(horizontal='right')
+
+            # Total column
+            total_cell = ws.cell(row=row_idx, column=len(headers), value=monthly_language_totals[language])
+            total_cell.number_format = '#,##0'
+            total_cell.font = Font(bold=True)
+            total_cell.fill = PatternFill(start_color="F0F7FF", end_color="F0F7FF", fill_type="solid")
+            total_cell.alignment = Alignment(horizontal='right')
+
+        # Auto-size columns
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            ws.column_dimensions[column].width = min(max_length + 2, 50)
+
+        # Enable AutoFilter
+        ws.auto_filter.ref = ws.dimensions
+
+        # Add bar chart
+        if len(sorted_languages) > 0:
+            chart = BarChart()
+            chart.title = "Words Processed by Language"
+            chart.y_axis.title = "Words"
+            chart.x_axis.title = "Language"
+
+            # Total column data
+            data = Reference(ws, min_col=len(headers), min_row=1, max_row=len(sorted_languages) + 1)
+            cats = Reference(ws, min_col=1, min_row=2, max_row=len(sorted_languages) + 1)
+
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            chart.height = 15
+            chart.width = 25
+
+            ws.add_chart(chart, f"A{len(sorted_languages) + 3}")
+
+    def _create_ytd_sheet(self, wb: 'Workbook', ytd_monthly_breakdown: Dict):
+        """Create the YTD sheet with monthly breakdown."""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.chart import LineChart, Reference
+
+        ws = wb.create_sheet(f"YTD - {self.ytd_start_month} to {self.ytd_end_month}")
+
+        months = ytd_monthly_breakdown['months']
+        ytd_languages = ytd_monthly_breakdown['languages']
+
+        # Write headers
+        headers = ['Language'] + months + ['Total']
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+            cell.alignment = Alignment(horizontal='center')
+
+        # Write data rows
+        sorted_languages = sorted(ytd_languages.items(), key=lambda x: sum(x[1].values()), reverse=True)
+        for row_idx, (language, month_data) in enumerate(sorted_languages, 2):
+            ws.cell(row=row_idx, column=1, value=language)
+
+            row_total = 0
+            for col_idx, month in enumerate(months, 2):
+                words = month_data.get(month, 0)
+                cell = ws.cell(row=row_idx, column=col_idx, value=words)
+                cell.number_format = '#,##0'
+                cell.alignment = Alignment(horizontal='right')
+                row_total += words
+
+            # Total column
+            total_cell = ws.cell(row=row_idx, column=len(headers), value=row_total)
+            total_cell.number_format = '#,##0'
+            total_cell.font = Font(bold=True)
+            total_cell.fill = PatternFill(start_color="F0F7FF", end_color="F0F7FF", fill_type="solid")
+            total_cell.alignment = Alignment(horizontal='right')
+
+        # Auto-size columns
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            ws.column_dimensions[column].width = min(max_length + 2, 50)
+
+        # Enable AutoFilter
+        ws.auto_filter.ref = ws.dimensions
+
+        # Add line chart for top 10 languages
+        if len(sorted_languages) > 0:
+            chart = LineChart()
+            chart.title = "Language Translation Trends (Top 10)"
+            chart.y_axis.title = "Words"
+            chart.x_axis.title = "Month"
+
+            # Add data for top 10 languages
+            num_langs = min(10, len(sorted_languages))
+            for row_idx in range(2, num_langs + 2):
+                data = Reference(ws, min_col=2, max_col=len(months) + 1, min_row=row_idx, max_row=row_idx)
+                chart.add_data(data, titles_from_data=False)
+
+            # Set categories (months)
+            cats = Reference(ws, min_col=2, max_col=len(months) + 1, min_row=1, max_row=1)
+            chart.set_categories(cats)
+
+            # Series labels are automatically pulled from the language column (col 1)
+            # We need to add titles manually using SeriesLabel
+            from openpyxl.chart.series import SeriesLabel
+            from openpyxl.chart.text import StrRef, Text
+            for idx, (language, _) in enumerate(sorted_languages[:num_langs]):
+                # Create a simple text-based title
+                text = Text()
+                text.rich = None
+                text.plain = language
+                series_label = SeriesLabel()
+                series_label.strRef = None
+                series_label.v = language
+                chart.series[idx].tx = series_label
+
+            chart.height = 15
+            chart.width = 25
+
+            ws.add_chart(chart, f"A{len(sorted_languages) + 3}")
+
+    def _create_user_monthly_sheet(self, wb: 'Workbook', monthly_data: Dict):
+        """Create the monthly user statistics sheet."""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.chart import BarChart, Reference
+
+        user_statistics = monthly_data.get('user_statistics', {})
+        if not user_statistics:
+            return  # Skip if no user data
+
+        ws = wb.create_sheet(f"User Stats - {self.report_month}")
+
+        # Get all workflow steps
+        all_steps = set()
+        for user_data in user_statistics.values():
+            all_steps.update(user_data['workflow_steps'].keys())
+        workflow_steps = sorted(all_steps, key=lambda x: ['translate', 'correct', 'final review'].index(x) if x in ['translate', 'correct', 'final review'] else 999)
+
+        # Write headers
+        headers = ['User', 'Language'] + workflow_steps + ['Total']
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+            cell.alignment = Alignment(horizontal='center')
+
+        # Write data rows - sort by total words descending
+        sorted_users = sorted(user_statistics.items(),
+                             key=lambda x: sum(x[1]['workflow_steps'].values()),
+                             reverse=True)
+
+        for row_idx, (user_key, user_data) in enumerate(sorted_users, 2):
+            ws.cell(row=row_idx, column=1, value=user_data['username'])
+            ws.cell(row=row_idx, column=2, value=user_data['language'])
+
+            row_total = 0
+            for col_idx, step in enumerate(workflow_steps, 3):
+                words = user_data['workflow_steps'].get(step, 0)
+                cell = ws.cell(row=row_idx, column=col_idx, value=words)
+                cell.number_format = '#,##0'
+                cell.alignment = Alignment(horizontal='right')
+                row_total += words
+
+            # Total column
+            total_cell = ws.cell(row=row_idx, column=len(headers), value=row_total)
+            total_cell.number_format = '#,##0'
+            total_cell.font = Font(bold=True)
+            total_cell.fill = PatternFill(start_color="F0F7FF", end_color="F0F7FF", fill_type="solid")
+            total_cell.alignment = Alignment(horizontal='right')
+
+        # Auto-size columns
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            ws.column_dimensions[column].width = min(max_length + 2, 50)
+
+        # Enable AutoFilter
+        ws.auto_filter.ref = ws.dimensions
+
+        # Add bar chart for top 20 users
+        if len(sorted_users) > 0:
+            chart = BarChart()
+            chart.title = "Words Processed by User (Top 20)"
+            chart.y_axis.title = "Words"
+            chart.x_axis.title = "User"
+
+            # Total column data (limit to top 20)
+            num_users = min(20, len(sorted_users))
+            data = Reference(ws, min_col=len(headers), min_row=1, max_row=num_users + 1)
+            cats = Reference(ws, min_col=1, min_row=2, max_row=num_users + 1)
+
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            chart.height = 15
+            chart.width = 25
+
+            ws.add_chart(chart, f"A{len(sorted_users) + 3}")
+
+    def _create_user_ytd_sheet(self, wb: 'Workbook', ytd_monthly_breakdown: Dict):
+        """Create the YTD user statistics sheet."""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.chart import LineChart, Reference
+        from openpyxl.chart.series import SeriesLabel
+
+        months = ytd_monthly_breakdown['months']
+        ytd_users = ytd_monthly_breakdown.get('users', {})
+
+        if not ytd_users:
+            return  # Skip if no user data
+
+        ws = wb.create_sheet(f"User Stats - YTD")
+
+        # Write headers
+        headers = ['User', 'Language'] + months + ['Total']
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+            cell.alignment = Alignment(horizontal='center')
+
+        # Write data rows - sort by total words descending
+        sorted_users = sorted(ytd_users.items(),
+                             key=lambda x: sum(x[1]['months'].values()),
+                             reverse=True)
+
+        for row_idx, (user_key, user_data) in enumerate(sorted_users, 2):
+            ws.cell(row=row_idx, column=1, value=user_data['username'])
+            ws.cell(row=row_idx, column=2, value=user_data['language'])
+
+            row_total = 0
+            for col_idx, month in enumerate(months, 3):
+                words = user_data['months'].get(month, 0)
+                cell = ws.cell(row=row_idx, column=col_idx, value=words)
+                cell.number_format = '#,##0'
+                cell.alignment = Alignment(horizontal='right')
+                row_total += words
+
+            # Total column
+            total_cell = ws.cell(row=row_idx, column=len(headers), value=row_total)
+            total_cell.number_format = '#,##0'
+            total_cell.font = Font(bold=True)
+            total_cell.fill = PatternFill(start_color="F0F7FF", end_color="F0F7FF", fill_type="solid")
+            total_cell.alignment = Alignment(horizontal='right')
+
+        # Auto-size columns
+        for col in ws.columns:
+            max_length = 0
+            column = col[0].column_letter
+            for cell in col:
+                if cell.value:
+                    max_length = max(max_length, len(str(cell.value)))
+            ws.column_dimensions[column].width = min(max_length + 2, 50)
+
+        # Enable AutoFilter
+        ws.auto_filter.ref = ws.dimensions
+
+        # Add line chart for top 10 users
+        if len(sorted_users) > 0:
+            chart = LineChart()
+            chart.title = "User Productivity Trends (Top 10)"
+            chart.y_axis.title = "Words"
+            chart.x_axis.title = "Month"
+
+            # Add data for top 10 users
+            num_users = min(10, len(sorted_users))
+            for row_idx in range(2, num_users + 2):
+                data = Reference(ws, min_col=3, max_col=len(months) + 2, min_row=row_idx, max_row=row_idx)
+                chart.add_data(data, titles_from_data=False)
+
+            # Set categories (months)
+            cats = Reference(ws, min_col=3, max_col=len(months) + 2, min_row=1, max_row=1)
+            chart.set_categories(cats)
+
+            # Add series labels using SeriesLabel
+            for idx, (user_key, user_data) in enumerate(sorted_users[:num_users]):
+                username = user_data['username']
+                language = user_data['language']
+                series_label = SeriesLabel()
+                series_label.strRef = None
+                series_label.v = f"{username} ({language})"
+                chart.series[idx].tx = series_label
+
+            chart.height = 15
+            chart.width = 25
+
+            ws.add_chart(chart, f"A{len(sorted_users) + 3}")
 
     def create_combined_html_report(self, monthly_data: Dict, ytd_monthly_breakdown: Dict, output_path: str) -> str:
         """Create a combined interactive HTML report with both monthly and YTD data."""
@@ -1726,8 +2112,8 @@ Please check the log file at:
             logger.warning(f"Error checking/launching Outlook: {e}")
             return False
 
-    def send_email_via_outlook(self, report_path: str, monthly_data: Dict, ytd_data: Dict):
-        """Create and open email draft in Outlook (macOS version)."""
+    def send_email_via_outlook(self, html_path: str, excel_path: str, monthly_data: Dict, ytd_data: Dict):
+        """Create and open email draft in Outlook (macOS version) with both HTML and Excel attachments."""
         try:
             logger.info("Preparing to send email via Outlook")
 
@@ -1758,23 +2144,24 @@ Year-to-Date Summary ({self.ytd_start_month} to {self.ytd_end_month}):
 - Top Languages:
 {ytd_stats['top_languages']}
 
-The attached HTML report is interactive and includes:
+Two reports are attached:
 
-Monthly Section:
-• Bar charts showing translation volume by language and workflow step
-• User productivity bar charts
+1. Interactive HTML Report:
+   • Bar charts showing translation volume by language and workflow step
+   • User productivity bar charts
+   • Line charts showing monthly trends for all languages
+   • Sortable tables (click any column header to sort)
+   • Filterable data (use the search boxes to filter by language or user)
+   • Open in your web browser for full interactivity
 
-Year-to-Date Section:
-• Line charts showing monthly trends for all languages
-• User productivity trends over time
-
-All sections include:
-• Sortable tables (click any column header to sort)
-• Filterable data (use the search boxes to filter by language or user)
+2. Excel Workbook (.xlsx):
+   • Monthly data sheet with workflow breakdown
+   • Year-to-Date sheet with monthly trends
+   • Built-in bar and line charts
+   • AutoFilter enabled for easy sorting and filtering
+   • Open in Excel, Google Sheets, or Numbers
 
 Report Generated: {self.report_date.strftime('%Y-%m-%d %H:%M')}
-
-Please open the HTML file in your web browser to view the complete interactive report.
 
 Best regards
 """
@@ -1782,34 +2169,42 @@ Best regards
             # Escape quotes and backslashes for AppleScript
             subject_escaped = subject.replace('\\', '\\\\').replace('"', '\\"')
             body_escaped = body.replace('\\', '\\\\').replace('"', '\\"')
-            report_path_posix = Path(report_path).as_posix()
+            html_path_posix = Path(html_path).as_posix()
+            excel_path_posix = Path(excel_path).as_posix()
 
             recipients = self.config['email_recipients']
 
             # Try Microsoft Outlook first (already ensured it's running if auto_send)
-            outlook_result = self._create_outlook_email_mac(subject_escaped, body_escaped, recipients, report_path_posix)
+            outlook_result = self._create_outlook_email_mac(subject_escaped, body_escaped, recipients,
+                                                           html_path_posix, excel_path_posix)
             if outlook_result:
                 return
 
             # Fall back to Apple Mail
             logger.info("Microsoft Outlook not available, trying Apple Mail")
-            apple_result = self._create_apple_mail_email(subject_escaped, body_escaped, recipients, report_path_posix)
+            apple_result = self._create_apple_mail_email(subject_escaped, body_escaped, recipients,
+                                                        html_path_posix, excel_path_posix)
             if apple_result:
                 return
 
-            # If both fail, just open the report
-            logger.warning("Could not create email draft. Opening report file.")
-            subprocess.run(['open', report_path])
-            print(f"\n⚠ Email draft creation failed. Report opened: {report_path}")
+            # If both fail, just open the reports
+            logger.warning("Could not create email draft. Opening report files.")
+            subprocess.run(['open', html_path])
+            subprocess.run(['open', excel_path])
+            print(f"\n⚠ Email draft creation failed. Reports opened:")
+            print(f"  HTML: {html_path}")
+            print(f"  Excel: {excel_path}")
             print(f"Recipients: {', '.join(recipients)}")
 
         except Exception as e:
             logger.error(f"Failed to create email: {e}")
-            logger.info(f"Report saved to: {report_path}")
+            logger.info(f"HTML report saved to: {html_path}")
+            logger.info(f"Excel report saved to: {excel_path}")
             raise
 
-    def _create_outlook_email_mac(self, subject: str, body: str, recipients: List[str], attachment_path: str) -> bool:
-        """Create email draft in Microsoft Outlook for Mac using AppleScript."""
+    def _create_outlook_email_mac(self, subject: str, body: str, recipients: List[str],
+                                 html_path: str, excel_path: str) -> bool:
+        """Create email draft in Microsoft Outlook for Mac using AppleScript with both attachments."""
         try:
             # Build recipient list for AppleScript - simpler syntax
             recipients_script = ""
@@ -1824,7 +2219,8 @@ Best regards
                     set new_message to make new outgoing message with properties {{subject:"{subject}", content:"{body}"}}
                     tell new_message
                         {recipients_script}
-                        make new attachment with properties {{file:POSIX file "{attachment_path}"}}
+                        make new attachment with properties {{file:POSIX file "{html_path}"}}
+                        make new attachment with properties {{file:POSIX file "{excel_path}"}}
                         send
                     end tell
                 end tell
@@ -1835,7 +2231,8 @@ Best regards
                     set new_message to make new outgoing message with properties {{subject:"{subject}", content:"{body}"}}
                     tell new_message
                         {recipients_script}
-                        make new attachment with properties {{file:POSIX file "{attachment_path}"}}
+                        make new attachment with properties {{file:POSIX file "{html_path}"}}
+                        make new attachment with properties {{file:POSIX file "{excel_path}"}}
                     end tell
                     open new_message
                     activate
@@ -1863,8 +2260,9 @@ Best regards
             logger.warning(f"Failed to create Outlook email on Mac: {e}")
             return False
 
-    def _create_apple_mail_email(self, subject: str, body: str, recipients: List[str], attachment_path: str) -> bool:
-        """Create email draft in Apple Mail using AppleScript."""
+    def _create_apple_mail_email(self, subject: str, body: str, recipients: List[str],
+                                html_path: str, excel_path: str) -> bool:
+        """Create email draft in Apple Mail using AppleScript with both attachments."""
         try:
             # Build recipient list for AppleScript
             recipients_script = ""
@@ -1881,7 +2279,8 @@ Best regards
                     tell new_message
                         {recipients_script}
                         set the content to "{body}"
-                        make new attachment with properties {{file name:POSIX file "{attachment_path}"}}
+                        make new attachment with properties {{file name:POSIX file "{html_path}"}}
+                        make new attachment with properties {{file name:POSIX file "{excel_path}"}}
                     end tell
                     send new_message
                 end tell
@@ -1893,7 +2292,8 @@ Best regards
                     tell new_message
                         {recipients_script}
                         set the content to "{body}"
-                        make new attachment with properties {{file name:POSIX file "{attachment_path}"}}
+                        make new attachment with properties {{file name:POSIX file "{html_path}"}}
+                        make new attachment with properties {{file name:POSIX file "{excel_path}"}}
                     end tell
                     activate
                 end tell
@@ -1969,6 +2369,12 @@ Best regards
             self.create_combined_html_report(monthly_data, ytd_monthly_breakdown, html_path)
             logger.info(f"Combined HTML report saved to {html_path}")
 
+            # Create Excel report
+            excel_filename = f"XTM_Report_{self.report_month}_{self.report_date.strftime('%Y%m%d')}.xlsx"
+            excel_path = str(output_dir / excel_filename)
+            self.create_excel_report(monthly_data, ytd_monthly_breakdown, excel_path)
+            logger.info(f"Excel report saved to {excel_path}")
+
             # Construct a minimal ytd_data for the email body stats
             ytd_data = {
                 'project_stats': {'total': 0, 'completed': 0, 'in_progress': 0, 'pending': 0},
@@ -1986,14 +2392,16 @@ Best regards
 
             # Send via Outlook
             try:
-                self.send_email_via_outlook(html_path, monthly_data, ytd_data)
+                self.send_email_via_outlook(html_path, excel_path, monthly_data, ytd_data)
                 email_success = True
             except Exception as e:
                 logger.error(f"Failed to send email: {e}", exc_info=True)
                 email_success = False
 
             logger.info("Report generation completed successfully")
-            print(f"\n✓ HTML Report generated: {html_path}")
+            print(f"\n✓ Reports generated:")
+            print(f"  - HTML: {html_path}")
+            print(f"  - Excel: {excel_path}")
             print(f"✓ Period: {self.report_month} (YTD: {self.ytd_start_month} to {self.ytd_end_month})")
             if email_success:
                 if self.auto_send:
@@ -2001,7 +2409,7 @@ Best regards
                 else:
                     print(f"✓ Email draft created with {len(self.config['email_recipients'])} recipients")
             else:
-                print(f"⚠ Email could not be sent - report saved locally")
+                print(f"⚠ Email could not be sent - reports saved locally")
 
         except Exception as e:
             logger.error(f"Report generation failed: {e}", exc_info=True)

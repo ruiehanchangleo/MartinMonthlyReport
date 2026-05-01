@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Automated monthly reporting system for XTM Cloud translation management. Generates Excel reports with translation metrics, excludes specific users, converts locale codes to readable language names, and emails reports via Microsoft Outlook.
+Automated monthly reporting system for XTM Cloud translation management. Generates both HTML and Excel reports with translation metrics, excludes specific users, converts locale codes to readable language names, and emails reports via Microsoft Outlook.
 
 ## Core Commands
 
@@ -72,7 +72,11 @@ The automation includes multiple layers of error handling to ensure it never fai
 
 **Locale Translation**: All locale codes (e.g., `es_ES`, `zh_TW`) are converted to readable language names (e.g., "Spanish", "Chinese (Traditional)") using the `LOCALE_TO_LANGUAGE` dictionary (66 mappings). This happens during data aggregation via `_locale_to_language_name()`.
 
-**Custom Column Ordering**: Workflow steps appear in a specific order: Language, translate, correct, final review, Total. This is enforced in `create_workflow_sheet()` using a predefined `workflow_order` list.
+**Custom Column Ordering**: Workflow steps appear in a specific order: Language, translate, correct, final review, Total. This is enforced in both HTML and Excel reports.
+
+**Dual Report Format**: The system generates two complementary report formats:
+- **HTML Report**: Interactive browser-based report with Chart.js charts, sortable tables, and dynamic filtering
+- **Excel Report**: Traditional spreadsheet with built-in charts, AutoFilter, and easy data manipulation
 
 ### Main Class: XTMReportGenerator
 
@@ -80,54 +84,80 @@ The automation includes multiple layers of error handling to ensure it never fai
 
 - `get_project_statistics(project_id, excluded_users)`: Fetches per-user statistics and filters out excluded users
 - `aggregate_monthly_data(start_month, end_month)`: Aggregates all project data for the reporting period, summing words from filtered users
-- `aggregate_monthly_breakdown(start_month, end_month)`: Aggregates data month-by-month for YTD line charts (returns monthly breakdown structure)
-- `create_workflow_sheet(wb, sheet_name, data, title)`: Creates Excel sheet with AutoFilter enabled, custom column ordering, and bar charts
-- `create_ytd_monthly_breakdown_sheet(wb, sheet_name, monthly_breakdown, title)`: Creates YTD sheet with monthly columns and line charts showing trends
-- `send_email_via_outlook(report_path, monthly_data, ytd_data)`: Handles email via Outlook with automatic launching and fallback to Apple Mail
+- `aggregate_ytd_data(start_month, end_month, current_month_data)`: Aggregates YTD data, uses JSON cache for past months
+- `create_combined_html_report(monthly_data, ytd_monthly_breakdown, output_path)`: Creates interactive HTML report with embedded and dynamic charts
+- `create_excel_report(monthly_data, ytd_monthly_breakdown, output_path)`: Creates Excel workbook with monthly and YTD sheets
+- `_create_monthly_sheet(wb, monthly_data)`: Creates Excel monthly sheet with bar charts
+- `_create_ytd_sheet(wb, ytd_monthly_breakdown)`: Creates Excel YTD sheet with line charts
+- `send_email_via_outlook(html_path, excel_path, monthly_data, ytd_data)`: Handles email via Outlook with both attachments and fallback to Apple Mail
 - `_ensure_outlook_running()`: Launches Outlook if not running (for --auto-send mode)
 
 **Data Flow:**
 
 1. Load config from `xtm_config.json`
-2. For each project, call `/projects/{id}/statistics`
+2. For each project, call `/projects/{id}/statistics` (with parallel API calls for speed)
 3. Filter out excluded users from `usersStatistics` array
 4. Aggregate word counts by language and workflow step
 5. Convert locale codes to language names
-6. Generate Excel with multiple sheets:
-   - Monthly: Current month summary with bar charts
-   - Year-to-Date: Monthly breakdown with line charts showing trends
-   - User Statistics sheets (if available)
-7. Enable AutoFilter on all data sheets
-8. Add charts: bar charts for monthly totals, line charts for YTD trends
-9. Launch Outlook (if needed) and create/send email
+6. Generate HTML report:
+   - Interactive charts using Chart.js (with matplotlib static fallbacks)
+   - Sortable and filterable tables
+   - Responsive design for mobile and desktop
+7. Generate Excel report:
+   - Monthly sheet: Current month summary with bar charts
+   - YTD sheet: Monthly breakdown with line charts showing trends
+   - AutoFilter enabled on all sheets
+8. Launch Outlook (if needed) and create/send email with both attachments
+9. Save JSON cache for future YTD queries
 
-### Excel Report Structure
+### Report Structure
 
-**Sheets Generated:**
+**HTML Report Features:**
+- Interactive Chart.js visualizations (with matplotlib PNG fallbacks)
+- Sortable tables (click column headers)
+- Dynamic filtering by language and user
+- Search boxes for quick filtering
+- Responsive design for mobile and desktop
+- Two main sections: Monthly and Year-to-Date
+- Each section includes language and user breakdowns
 
-1. **Monthly**: Current month data (e.g., "2026-01")
+**Excel Workbook Sheets:**
+
+1. **Monthly - YYYY-MM**: Current month data
    - Column headers: Language, translate, correct, final review, Total
    - Data rows sorted by total words (descending)
-   - AutoFilter enabled on all columns (for sorting/filtering)
+   - AutoFilter enabled on all columns
    - Bar chart showing total words per language
 
-2. **Year-to-Date**: Monthly breakdown from January to current month
+2. **YTD - YYYY-MM to YYYY-MM**: Year-to-Date monthly breakdown
    - Column headers: Language, Month1, Month2, ..., Total
    - Shows words processed per language per month
    - Data rows sorted by total words (descending)
-   - AutoFilter enabled on all columns (for sorting/filtering)
-   - Line charts showing monthly trends for top 10 languages
+   - AutoFilter enabled on all columns
+   - Line chart showing monthly trends for top 10 languages
 
-3. **User Statistics - Monthly**: Per-user breakdown for current month (if available)
-4. **User Statistics - YTD**: Per-user cumulative totals for year-to-date (if available)
+3. **User Stats - YYYY-MM**: Per-user breakdown for current month
+   - Column headers: User, Language, workflow steps, Total
+   - Data rows sorted by total words (descending)
+   - AutoFilter enabled on all columns
+   - Bar chart showing top 20 users
+
+4. **User Stats - YTD**: Per-user cumulative totals for year-to-date
+   - Column headers: User, Language, Month1, Month2, ..., Total
+   - Shows words processed per user per month
+   - Data rows sorted by total words (descending)
+   - AutoFilter enabled on all columns
+   - Line chart showing trends for top 10 users
 
 ### Email Automation (macOS)
+
+**Dual Attachments**: Both HTML and Excel reports are attached to the email.
 
 **Outlook Priority**: Always tries Microsoft Outlook first, falls back to Apple Mail if Outlook unavailable.
 
 **Auto-Launch**: In `--auto-send` mode, script detects if Outlook is running and launches it automatically if needed (waits up to 30 seconds for startup).
 
-**AppleScript**: Uses AppleScript to control Outlook/Mail, creating messages with recipients and attachments.
+**AppleScript**: Uses AppleScript to control Outlook/Mail, creating messages with recipients and both attachments.
 
 **Draft vs Send**: Without `--auto-send`, creates draft for review. With `--auto-send`, sends immediately.
 
