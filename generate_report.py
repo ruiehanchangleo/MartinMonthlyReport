@@ -180,26 +180,51 @@ class XTMReportGenerator:
         "BSP_Tester"
     ]
 
-    def __init__(self, config_path: str = "xtm_config.json", auto_send: bool = False):
+    def __init__(self, config_path: str = "xtm_config.json", auto_send: bool = False, weekly: bool = False):
         """Initialize the report generator with configuration."""
         self.config = self._load_config(config_path)
         self.auto_send = auto_send
+        self.weekly = weekly
         self.base_url = self.config['base_url']
         self.headers = {
             'Authorization': f"{self.config['auth_type']} {self.config['auth_token']}",
             'Content-Type': 'application/json'
         }
         self.report_date = datetime.now()
-        # Calculate previous month for the monthly report
-        first_day_current_month = self.report_date.replace(day=1)
-        last_day_previous_month = first_day_current_month - timedelta(days=1)
 
-        self.report_month = last_day_previous_month.strftime('%Y-%m')
-        self.report_month_name = last_day_previous_month.strftime('%B %Y')
+        if self.weekly:
+            # Calculate previous 7 days for weekly report
+            # Week ends on Sunday (yesterday if today is Monday, or last Sunday)
+            end_date = self.report_date - timedelta(days=1)  # Yesterday
+            start_date = end_date - timedelta(days=6)  # 7 days total including end_date
 
-        # Get year-to-date range (January 1 to end of previous month)
-        self.ytd_start_month = last_day_previous_month.strftime('%Y-01')
-        self.ytd_end_month = self.report_month
+            self.report_start_date = start_date
+            self.report_end_date = end_date
+            self.report_period = f"{start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')}"
+            self.report_week_label = f"Week of {start_date.strftime('%Y-%m-%d')}"
+
+            # For weekly reports, we don't use month-based ranges
+            self.report_month = None
+            self.report_month_name = None
+            self.ytd_start_month = None
+            self.ytd_end_month = None
+        else:
+            # Calculate previous month for the monthly report
+            first_day_current_month = self.report_date.replace(day=1)
+            last_day_previous_month = first_day_current_month - timedelta(days=1)
+
+            self.report_month = last_day_previous_month.strftime('%Y-%m')
+            self.report_month_name = last_day_previous_month.strftime('%B %Y')
+
+            # Get year-to-date range (January 1 to end of previous month)
+            self.ytd_start_month = last_day_previous_month.strftime('%Y-01')
+            self.ytd_end_month = self.report_month
+
+            # Monthly reports don't use these
+            self.report_start_date = None
+            self.report_end_date = None
+            self.report_period = None
+            self.report_week_label = None
 
     def _load_config(self, config_path: str) -> Dict:
         """Load configuration from JSON file."""
@@ -307,10 +332,15 @@ class XTMReportGenerator:
         # 5. Validate date calculations
         try:
             logger.info("Validating date calculations...")
-            if not self.report_month or not self.ytd_start_month:
-                raise ValueError("Invalid date calculations")
-            logger.info(f"✓ Report period: {self.report_month_name}")
-            logger.info(f"✓ YTD period: {self.ytd_start_month} to {self.ytd_end_month}")
+            if self.weekly:
+                if not self.report_start_date or not self.report_end_date:
+                    raise ValueError("Invalid weekly date calculations")
+                logger.info(f"✓ Weekly report period: {self.report_period}")
+            else:
+                if not self.report_month or not self.ytd_start_month:
+                    raise ValueError("Invalid date calculations")
+                logger.info(f"✓ Report period: {self.report_month_name}")
+                logger.info(f"✓ YTD period: {self.ytd_start_month} to {self.ytd_end_month}")
         except Exception as e:
             logger.error(f"✗ Date validation failed: {e}")
             all_passed = False
@@ -661,7 +691,7 @@ class XTMReportGenerator:
                                         user_key = f"{username}|{target_lang_name}"
                                         if user_key not in data['user_statistics']:
                                             data['user_statistics'][user_key] = {
-                                                'username': username,
+                                                'user': username,
                                                 'language': target_lang_name,
                                                 'workflow_steps': {}
                                             }
@@ -741,7 +771,7 @@ class XTMReportGenerator:
 
             for uk, ud in month_data.get('user_statistics', {}).items():
                 cache['users'][uk] = {
-                    'username': ud['username'],
+                    'user': ud['user'],
                     'language': ud['language'],
                     'total': sum(ud['workflow_steps'].values())
                 }
@@ -763,6 +793,152 @@ class XTMReportGenerator:
         except Exception as e:
             logger.warning(f"Failed to load cache for {month}: {e}")
             return None
+
+    def aggregate_weekly_data(self, start_date: datetime, end_date: datetime) -> Dict:
+        """
+        Aggregate data for a specific weekly date range.
+        Similar to aggregate_monthly_data but uses exact dates instead of month ranges.
+        """
+        logger.info(f"Aggregating weekly data from {start_date.date()} to {end_date.date()}")
+
+        # Initialize data structures
+        data = {
+            'project_stats': {
+                'total': 0,
+                'completed': 0,
+                'in_progress': 0,
+                'pending': 0
+            },
+            'workflow_by_language': {},
+            'user_statistics': {},
+            'projects': []
+        }
+
+        # Get all projects
+        projects = self.get_projects()
+
+        # Fetch statistics and status for all projects in parallel
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def fetch_project_data(project_id):
+            try:
+                stats = self.get_project_statistics(project_id)
+                status = self.get_project_status_with_steps(project_id)
+                return project_id, stats, status
+            except Exception as e:
+                logger.warning(f"Failed to get data for project {project_id}: {e}")
+                return project_id, [], {}
+
+        project_ids = [p.get('id') for p in projects if p.get('id')]
+        project_map = {p.get('id'): p for p in projects if p.get('id')}
+        project_results = {}
+
+        logger.info(f"Fetching data for {len(project_ids)} projects using parallel requests...")
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(fetch_project_data, pid): pid for pid in project_ids}
+            for future in as_completed(futures):
+                pid, stats_list, project_status = future.result()
+                project_results[pid] = (stats_list, project_status)
+
+        # Process projects (same logic as monthly)
+        for project_id in project_ids:
+            project = project_map[project_id]
+            stats_list, project_status = project_results[project_id]
+
+            job_step_dates = {}
+            if project_status:
+                for job in project_status.get('jobs', []):
+                    job_id = job.get('jobId')
+                    if job_id:
+                        job_step_dates[job_id] = {}
+                        for step in job.get('steps', []):
+                            step_name = step.get('workflowStepName', '')
+                            finish_date = step.get('finishDate')
+                            if finish_date and step_name:
+                                job_step_dates[job_id][step_name.lower()] = finish_date
+
+            if isinstance(stats_list, list) and stats_list:
+                project_total_words = 0
+                project_has_work_in_period = False
+                target_languages = []
+
+                for lang_stats in stats_list:
+                    target_lang_code = lang_stats.get('targetLanguage', 'unknown')
+                    target_lang_name = self._locale_to_language_name(target_lang_code)
+                    users_statistics = lang_stats.get('usersStatistics', [])
+
+                    for user_stat in users_statistics:
+                        steps_statistics = user_stat.get('stepsStatistics', [])
+
+                        for step_stat in steps_statistics:
+                            step_name = step_stat.get('workflowStepName', '')
+                            clean_step_name = ''.join([c for c in step_name if not c.isdigit()])
+                            jobs_statistics = step_stat.get('jobsStatistics', [])
+
+                            for job_stat in jobs_statistics:
+                                include_this_job = False
+                                job_id = job_stat.get('jobId')
+
+                                finish_date_ts = None
+                                if job_id and job_id in job_step_dates:
+                                    finish_date_ts = job_step_dates[job_id].get(step_name.lower())
+
+                                # Check if completed in weekly date range
+                                if finish_date_ts:
+                                    completion_date = datetime.fromtimestamp(finish_date_ts / 1000)
+                                    # Include end_date in range (<=)
+                                    if start_date <= completion_date <= end_date:
+                                        include_this_job = True
+
+                                if include_this_job:
+                                    source_stats = job_stat.get('sourceStatistics', {})
+                                    total_words = source_stats.get('totalWords', 0)
+
+                                    if total_words > 0:
+                                        project_has_work_in_period = True
+                                        if target_lang_name not in target_languages:
+                                            target_languages.append(target_lang_name)
+
+                                        username = self._resolve_user_name(user_stat)
+                                        user_key = f"{username}|{target_lang_name}"
+
+                                        if user_key not in data['user_statistics']:
+                                            data['user_statistics'][user_key] = {
+                                                'user': username,
+                                                'language': target_lang_name,
+                                                'workflow_steps': {}
+                                            }
+
+                                        if clean_step_name not in data['user_statistics'][user_key]['workflow_steps']:
+                                            data['user_statistics'][user_key]['workflow_steps'][clean_step_name] = 0
+
+                                        data['user_statistics'][user_key]['workflow_steps'][clean_step_name] += total_words
+
+                                        # Track by language and workflow step
+                                        key = f"{clean_step_name} - {target_lang_name}"
+                                        if key not in data['workflow_by_language']:
+                                            data['workflow_by_language'][key] = {
+                                                'workflow_step': clean_step_name,
+                                                'language': target_lang_name,
+                                                'words_done': 0,
+                                                'words_to_be_done': 0,
+                                                'projects': 0
+                                            }
+
+                                        data['workflow_by_language'][key]['words_done'] += total_words
+                                        project_total_words += total_words
+
+                if project_has_work_in_period:
+                    data['project_stats']['total'] += 1
+                    data['projects'].append({
+                        'id': project_id,
+                        'name': project.get('name', 'Unknown'),
+                        'total_words': project_total_words,
+                        'target_languages': target_languages
+                    })
+
+        logger.info(f"Weekly aggregation complete: {data['project_stats']['total']} projects with work in period")
+        return data
 
     def aggregate_ytd_data(self, start_month: str, end_month: str, current_month_data: Dict = None) -> Dict:
         """
@@ -802,7 +978,7 @@ class XTMReportGenerator:
 
                 for uk, ud in current_month_data['user_statistics'].items():
                     if uk not in users:
-                        users[uk] = {'username': ud['username'], 'language': ud['language'], 'months': {}}
+                        users[uk] = {'user': ud['user'], 'language': ud['language'], 'months': {}}
                     users[uk]['months'][month] = sum(ud['workflow_steps'].values())
                 continue
 
@@ -817,7 +993,7 @@ class XTMReportGenerator:
 
                 for uk, ud in cached['users'].items():
                     if uk not in users:
-                        users[uk] = {'username': ud['username'], 'language': ud['language'], 'months': {}}
+                        users[uk] = {'user': ud['user'], 'language': ud['language'], 'months': {}}
                     users[uk]['months'][month] = ud['total']
                 continue
 
@@ -836,7 +1012,7 @@ class XTMReportGenerator:
 
                 for uk, ud in month_data['user_statistics'].items():
                     if uk not in users:
-                        users[uk] = {'username': ud['username'], 'language': ud['language'], 'months': {}}
+                        users[uk] = {'user': ud['user'], 'language': ud['language'], 'months': {}}
                     users[uk]['months'][month] = sum(ud['workflow_steps'].values())
 
                 # Save to cache for future runs
@@ -934,15 +1110,17 @@ class XTMReportGenerator:
         wb = Workbook()
         wb.remove(wb.active)  # Remove default sheet
 
-        # === MONTHLY SHEET ===
+        # === CURRENT PERIOD SHEET ===
         self._create_monthly_sheet(wb, monthly_data)
 
-        # === YTD SHEET ===
-        self._create_ytd_sheet(wb, ytd_monthly_breakdown)
+        # === YTD SHEET (only for monthly reports) ===
+        if not self.weekly:
+            self._create_ytd_sheet(wb, ytd_monthly_breakdown)
 
         # === USER STATISTICS SHEETS ===
         self._create_user_monthly_sheet(wb, monthly_data)
-        self._create_user_ytd_sheet(wb, ytd_monthly_breakdown)
+        if not self.weekly:
+            self._create_user_ytd_sheet(wb, ytd_monthly_breakdown)
 
         # Save workbook
         wb.save(output_path)
@@ -950,11 +1128,12 @@ class XTMReportGenerator:
         return output_path
 
     def _create_monthly_sheet(self, wb: 'Workbook', monthly_data: Dict):
-        """Create the monthly data sheet with workflow breakdown."""
+        """Create the current period data sheet with workflow breakdown."""
         from openpyxl.styles import Font, PatternFill, Alignment
         from openpyxl.chart import BarChart, Reference
 
-        ws = wb.create_sheet(f"Monthly - {self.report_month}")
+        sheet_name = f"Weekly - {self.report_week_label.replace('Week of ', '')}" if self.weekly else f"Monthly - {self.report_month}"
+        ws = wb.create_sheet(sheet_name)
 
         # Extract data
         workflow_by_language = monthly_data.get('workflow_by_language', {})
@@ -1130,7 +1309,8 @@ class XTMReportGenerator:
         if not user_statistics:
             return  # Skip if no user data
 
-        ws = wb.create_sheet(f"User Stats - {self.report_month}")
+        sheet_name = f"User Stats - {self.report_week_label.replace('Week of ', '')}" if self.weekly else f"User Stats - {self.report_month}"
+        ws = wb.create_sheet(sheet_name)
 
         # Get all workflow steps
         all_steps = set()
@@ -1152,7 +1332,7 @@ class XTMReportGenerator:
                              reverse=True)
 
         for row_idx, (user_key, user_data) in enumerate(sorted_users, 2):
-            ws.cell(row=row_idx, column=1, value=user_data['username'])
+            ws.cell(row=row_idx, column=1, value=user_data['user'])
             ws.cell(row=row_idx, column=2, value=user_data['language'])
 
             row_total = 0
@@ -1229,7 +1409,7 @@ class XTMReportGenerator:
                              reverse=True)
 
         for row_idx, (user_key, user_data) in enumerate(sorted_users, 2):
-            ws.cell(row=row_idx, column=1, value=user_data['username'])
+            ws.cell(row=row_idx, column=1, value=user_data['user'])
             ws.cell(row=row_idx, column=2, value=user_data['language'])
 
             row_total = 0
@@ -1278,7 +1458,7 @@ class XTMReportGenerator:
 
             # Add series labels using SeriesLabel
             for idx, (user_key, user_data) in enumerate(sorted_users[:num_users]):
-                username = user_data['username']
+                username = user_data['user']
                 language = user_data['language']
                 series_label = SeriesLabel()
                 series_label.strRef = None
@@ -1334,7 +1514,7 @@ class XTMReportGenerator:
         monthly_user_labels = []
         monthly_user_data_points = []
         for user_key, user_data in sorted(user_statistics.items(), key=lambda x: sum(x[1]['workflow_steps'].values()), reverse=True):
-            monthly_user_labels.append(f"{user_data['username']} ({user_data['language']})")
+            monthly_user_labels.append(f"{user_data['user']} ({user_data['language']})")
             monthly_user_data_points.append(sum(user_data['workflow_steps'].values()))
 
         # Create monthly language table HTML
@@ -1350,7 +1530,7 @@ class XTMReportGenerator:
         monthly_user_table_html = ""
         monthly_user_lang_map = {}  # language -> list of users
         for user_key, user_data in sorted(user_statistics.items(), key=lambda x: sum(x[1]['workflow_steps'].values()), reverse=True):
-            username = user_data['username']
+            username = user_data['user']
             language = user_data['language']
 
             # Build mapping
@@ -1366,73 +1546,84 @@ class XTMReportGenerator:
             row += f"<td class='number total'><strong>{total:,}</strong></td></tr>"
             monthly_user_table_html += row
 
-        # === YTD DATA ===
-        months = ytd_monthly_breakdown['months']
-        ytd_languages = ytd_monthly_breakdown['languages']
-        ytd_users = ytd_monthly_breakdown.get('users', {})
+        # === YTD DATA (only for monthly reports) ===
+        if not self.weekly:
+            months = ytd_monthly_breakdown['months']
+            ytd_languages = ytd_monthly_breakdown['languages']
+            ytd_users = ytd_monthly_breakdown.get('users', {})
 
-        # Prepare YTD line chart data
-        ytd_lang_datasets = []
-        lang_colors = [
-            '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF',
-            '#FF9F40', '#FF6384', '#C9CBCF', '#4BC0C0', '#FF9F40'
-        ]
+            # Prepare YTD line chart data
+            ytd_lang_datasets = []
+            lang_colors = [
+                '#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF',
+                '#FF9F40', '#FF6384', '#C9CBCF', '#4BC0C0', '#FF9F40'
+            ]
 
-        sorted_ytd_languages = sorted(ytd_languages.items(), key=lambda x: sum(x[1].values()), reverse=True)
+            sorted_ytd_languages = sorted(ytd_languages.items(), key=lambda x: sum(x[1].values()), reverse=True)
 
-        for idx, (language, month_data) in enumerate(sorted_ytd_languages):
-            data_points = [month_data.get(month, 0) for month in months]
-            ytd_lang_datasets.append({
-                'label': language,
-                'data': data_points,
-                'borderColor': lang_colors[idx % len(lang_colors)],
-                'backgroundColor': lang_colors[idx % len(lang_colors)] + '20',
-                'tension': 0.4
-            })
+            for idx, (language, month_data) in enumerate(sorted_ytd_languages):
+                data_points = [month_data.get(month, 0) for month in months]
+                ytd_lang_datasets.append({
+                    'label': language,
+                    'data': data_points,
+                    'borderColor': lang_colors[idx % len(lang_colors)],
+                    'backgroundColor': lang_colors[idx % len(lang_colors)] + '20',
+                    'tension': 0.4
+                })
 
-        # YTD user data
-        ytd_user_datasets = []
-        sorted_ytd_users = sorted(ytd_users.items(), key=lambda x: sum(x[1]['months'].values()), reverse=True)
+            # YTD user data
+            ytd_user_datasets = []
+            sorted_ytd_users = sorted(ytd_users.items(), key=lambda x: sum(x[1]['months'].values()), reverse=True)
 
-        for idx, (user_key, user_data) in enumerate(sorted_ytd_users):
-            username = user_data['username']
-            language = user_data['language']
-            data_points = [user_data['months'].get(month, 0) for month in months]
-            ytd_user_datasets.append({
-                'label': f"{username} ({language})",
-                'data': data_points,
-                'borderColor': lang_colors[idx % len(lang_colors)],
-                'backgroundColor': lang_colors[idx % len(lang_colors)] + '20',
-                'tension': 0.4
-            })
+            for idx, (user_key, user_data) in enumerate(sorted_ytd_users):
+                username = user_data['user']
+                language = user_data['language']
+                data_points = [user_data['months'].get(month, 0) for month in months]
+                ytd_user_datasets.append({
+                    'label': f"{username} ({language})",
+                    'data': data_points,
+                    'borderColor': lang_colors[idx % len(lang_colors)],
+                    'backgroundColor': lang_colors[idx % len(lang_colors)] + '20',
+                    'tension': 0.4
+                })
 
-        # Create YTD language table HTML
-        ytd_lang_table_html = ""
-        for language, month_data in sorted(ytd_languages.items(), key=lambda x: sum(x[1].values()), reverse=True):
-            row = f"<tr><td>{language}</td>"
-            for month in months:
-                row += f"<td class='number'>{month_data.get(month, 0):,}</td>"
-            row += f"<td class='number total'><strong>{sum(month_data.values()):,}</strong></td></tr>"
-            ytd_lang_table_html += row
+            # Create YTD language table HTML
+            ytd_lang_table_html = ""
+            for language, month_data in sorted(ytd_languages.items(), key=lambda x: sum(x[1].values()), reverse=True):
+                row = f"<tr><td>{language}</td>"
+                for month in months:
+                    row += f"<td class='number'>{month_data.get(month, 0):,}</td>"
+                row += f"<td class='number total'><strong>{sum(month_data.values()):,}</strong></td></tr>"
+                ytd_lang_table_html += row
 
-        # Create YTD user table HTML and build user-language mapping
-        ytd_user_table_html = ""
-        ytd_user_lang_map = {}  # language -> list of users
-        for user_key, user_data in sorted(ytd_users.items(), key=lambda x: sum(x[1]['months'].values()), reverse=True):
-            username = user_data['username']
-            language = user_data['language']
+            # Create YTD user table HTML and build user-language mapping
+            ytd_user_table_html = ""
+            ytd_user_lang_map = {}  # language -> list of users
+            for user_key, user_data in sorted(ytd_users.items(), key=lambda x: sum(x[1]['months'].values()), reverse=True):
+                username = user_data['user']
+                language = user_data['language']
 
-            # Build mapping
-            if language not in ytd_user_lang_map:
-                ytd_user_lang_map[language] = []
-            if username not in ytd_user_lang_map[language]:
-                ytd_user_lang_map[language].append(username)
+                # Build mapping
+                if language not in ytd_user_lang_map:
+                    ytd_user_lang_map[language] = []
+                if username not in ytd_user_lang_map[language]:
+                    ytd_user_lang_map[language].append(username)
 
-            row = f"<tr><td>{username}</td><td>{language}</td>"
-            for month in months:
-                row += f"<td class='number'>{user_data['months'].get(month, 0):,}</td>"
-            row += f"<td class='number total'><strong>{sum(user_data['months'].values()):,}</strong></td></tr>"
-            ytd_user_table_html += row
+                row = f"<tr><td>{username}</td><td>{language}</td>"
+                for month in months:
+                    row += f"<td class='number'>{user_data['months'].get(month, 0):,}</td>"
+                row += f"<td class='number total'><strong>{sum(user_data['months'].values()):,}</strong></td></tr>"
+                ytd_user_table_html += row
+        else:
+            # Weekly reports don't have YTD data
+            months = []
+            ytd_languages = {}
+            ytd_users = {}
+            ytd_lang_datasets = []
+            ytd_user_datasets = []
+            ytd_lang_table_html = ""
+            ytd_user_table_html = ""
+            ytd_user_lang_map = {}
 
         # Generate static chart images
         logger.info("Generating chart images...")
@@ -1446,16 +1637,103 @@ class XTMReportGenerator:
             [l[:30] for l in monthly_user_labels[:20]], monthly_user_ds,
             'Words Processed by User')
 
-        ytd_lang_ds = [{'label': l, 'data': [ytd_languages[l].get(m, 0) for m in months]}
-                       for l, _ in sorted_ytd_languages[:10]]
-        ytd_lang_chart_b64 = self._generate_line_chart_base64(
-            months, ytd_lang_ds, 'Language Trends (Top 10)')
+        # YTD charts only for monthly reports
+        if not self.weekly:
+            ytd_lang_ds = [{'label': l, 'data': [ytd_languages[l].get(m, 0) for m in months]}
+                           for l, _ in sorted_ytd_languages[:10]]
+            ytd_lang_chart_b64 = self._generate_line_chart_base64(
+                months, ytd_lang_ds, 'Language Trends (Top 10)')
 
-        ytd_user_ds = [{'label': f"{ud['username']} ({ud['language']})",
-                        'data': [ud['months'].get(m, 0) for m in months]}
-                       for _, ud in sorted_ytd_users[:10]]
-        ytd_user_chart_b64 = self._generate_line_chart_base64(
-            months, ytd_user_ds, 'User Productivity (Top 10)')
+            ytd_user_ds = [{'label': f"{ud['user']} ({ud['language']})",
+                            'data': [ud['months'].get(m, 0) for m in months]}
+                           for _, ud in sorted_ytd_users[:10]]
+            ytd_user_chart_b64 = self._generate_line_chart_base64(
+                months, ytd_user_ds, 'User Productivity (Top 10)')
+        else:
+            ytd_lang_chart_b64 = ""
+            ytd_user_chart_b64 = ""
+
+        # Generate YTD HTML section (only for monthly reports)
+        if not self.weekly:
+            ytd_section_html = f"""
+        <!-- YTD SECTION -->
+        <div class="section-divider">
+            <h2>📈 Year-to-Date Report - {self.ytd_start_month} to {self.ytd_end_month}</h2>
+        </div>
+
+        <div class="filter-panel">
+            <h3>🔍 Filters</h3>
+            <div class="filter-group">
+                <div class="filter-item">
+                    <label>Languages:</label>
+                    <input type="text" id="ytdLangSearch" placeholder="Type to search..." onkeyup="filterCheckboxes('ytdLangCheckboxes', this.value)">
+                    <div class="checkbox-list" id="ytdLangCheckboxes">
+                        {''.join(['<div class="checkbox-item"><input type="checkbox" id="ytdLang_' + lang.replace(" ", "_") + '" value="' + lang + '" onchange="applyFilters(' + "'ytd'" + ')"><label for="ytdLang_' + lang.replace(" ", "_") + '">' + lang + '</label></div>' for lang in sorted(ytd_languages.keys())])}
+                    </div>
+                </div>
+                <div class="filter-item">
+                    <label>Users:</label>
+                    <input type="text" id="ytdUserSearch" placeholder="Type to search..." onkeyup="filterCheckboxes('ytdUserCheckboxes', this.value)">
+                    <div class="checkbox-list" id="ytdUserCheckboxes">
+                        {''.join(['<div class="checkbox-item" data-lang="' + user_data["language"] + '"><input type="checkbox" id="ytdUser_' + user_data["user"].replace(" ", "_") + '" value="' + user_data["user"] + '" onchange="applyFilters(' + "'ytd'" + ')"><label for="ytdUser_' + user_data["user"].replace(" ", "_") + '">' + user_data["user"] + '</label></div>' for user_key, user_data in sorted(ytd_users.items(), key=lambda x: x[1]["user"])])}
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div class="data-row">
+            <div class="data-card">
+                <h3>🌍 Language Translation Trends</h3>
+                <img class="chart-img" id="ytdLangImg" src="data:image/png;base64,{ytd_lang_chart_b64}" alt="YTD Language Chart">
+                <div class="chart-container" id="ytdLangChartWrap"><canvas id="ytdLanguageChart"></canvas></div>
+            </div>
+            <div class="data-card">
+                <h3>📊 Language Data</h3>
+                <div class="table-container">
+                    <table id="ytdLangTable">
+                        <thead>
+                            <tr>
+                                <th class="sortable" onclick="sortTable('ytdLangTable', 0)">Language</th>
+                                {''.join([f'<th class="number sortable" onclick="sortTable(' + "'ytdLangTable', " + str(idx+1) + ')">' + month + '</th>' for idx, month in enumerate(months)])}
+                                <th class="number sortable" onclick="sortTable('ytdLangTable', {len(months)+1})">Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {ytd_lang_table_html}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+
+        <div class="data-row">
+            <div class="data-card">
+                <h3>👥 User Productivity Trends</h3>
+                <img class="chart-img" id="ytdUserImg" src="data:image/png;base64,{ytd_user_chart_b64}" alt="YTD User Chart">
+                <div class="chart-container" id="ytdUserChartWrap"><canvas id="ytdUserChart"></canvas></div>
+            </div>
+            <div class="data-card">
+                <h3>📊 User Data</h3>
+                <div class="table-container">
+                    <table id="ytdUserTable">
+                        <thead>
+                            <tr>
+                                <th class="sortable" onclick="sortTable('ytdUserTable', 0)">Name</th>
+                                <th class="sortable" onclick="sortTable('ytdUserTable', 1)">Language</th>
+                                {''.join([f'<th class="number sortable" onclick="sortTable(' + "'ytdUserTable', " + str(idx+2) + ')">' + month + '</th>' for idx, month in enumerate(months)])}
+                                <th class="number sortable" onclick="sortTable('ytdUserTable', {len(months)+2})">Total</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {ytd_user_table_html}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+"""
+        else:
+            ytd_section_html = ""
 
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
@@ -1527,15 +1805,15 @@ class XTMReportGenerator:
         <div class="header">
             <h1>📊 XTM Translation Report</h1>
             <div class="subtitle">
-                <strong>Report Period:</strong> {self.report_month_name} {self.report_month.split('-')[0]}<br>
-                <strong>Year-to-Date:</strong> {self.ytd_start_month} to {self.ytd_end_month}<br>
+                {'<strong>Report Period:</strong> ' + (self.report_period if self.weekly else f"{self.report_month_name} {self.report_month.split('-')[0]}") + '<br>' if (self.weekly or self.report_month_name) else ''}
+                {'' if self.weekly else f'<strong>Year-to-Date:</strong> {self.ytd_start_month} to {self.ytd_end_month}<br>'}
                 <strong>Generated:</strong> {self.report_date.strftime('%Y-%m-%d %H:%M')}
             </div>
         </div>
 
-        <!-- MONTHLY SECTION -->
+        <!-- CURRENT PERIOD SECTION -->
         <div class="section-divider">
-            <h2>📅 Monthly Report - {self.report_month_name}</h2>
+            <h2>{'📅 Weekly Report - ' + self.report_week_label if self.weekly else '📅 Monthly Report - ' + self.report_month_name}</h2>
         </div>
 
         <div class="filter-panel">
@@ -1552,7 +1830,7 @@ class XTMReportGenerator:
                     <label>Users:</label>
                     <input type="text" id="monthlyUserSearch" placeholder="Type to search..." onkeyup="filterCheckboxes('monthlyUserCheckboxes', this.value)">
                     <div class="checkbox-list" id="monthlyUserCheckboxes">
-                        {''.join(['<div class="checkbox-item" data-lang="' + user_data["language"] + '"><input type="checkbox" id="monthlyUser_' + user_data["username"].replace(" ", "_") + '" value="' + user_data["username"] + '" onchange="applyFilters(' + "'monthly'" + ')"><label for="monthlyUser_' + user_data["username"].replace(" ", "_") + '">' + user_data["username"] + '</label></div>' for user_key, user_data in sorted(user_statistics.items(), key=lambda x: x[1]["username"])])}
+                        {''.join(['<div class="checkbox-item" data-lang="' + user_data["language"] + '"><input type="checkbox" id="monthlyUser_' + user_data["user"].replace(" ", "_") + '" value="' + user_data["user"] + '" onchange="applyFilters(' + "'monthly'" + ')"><label for="monthlyUser_' + user_data["user"].replace(" ", "_") + '">' + user_data["user"] + '</label></div>' for user_key, user_data in sorted(user_statistics.items(), key=lambda x: x[1]["user"])])}
                     </div>
                 </div>
             </div>
@@ -1609,81 +1887,7 @@ class XTMReportGenerator:
             </div>
         </div>
 
-        <!-- YTD SECTION -->
-        <div class="section-divider">
-            <h2>📈 Year-to-Date Report - {self.ytd_start_month} to {self.ytd_end_month}</h2>
-        </div>
-
-        <div class="filter-panel">
-            <h3>🔍 Filters</h3>
-            <div class="filter-group">
-                <div class="filter-item">
-                    <label>Languages:</label>
-                    <input type="text" id="ytdLangSearch" placeholder="Type to search..." onkeyup="filterCheckboxes('ytdLangCheckboxes', this.value)">
-                    <div class="checkbox-list" id="ytdLangCheckboxes">
-                        {''.join(['<div class="checkbox-item"><input type="checkbox" id="ytdLang_' + lang.replace(" ", "_") + '" value="' + lang + '" onchange="applyFilters(' + "'ytd'" + ')"><label for="ytdLang_' + lang.replace(" ", "_") + '">' + lang + '</label></div>' for lang in sorted(ytd_languages.keys())])}
-                    </div>
-                </div>
-                <div class="filter-item">
-                    <label>Users:</label>
-                    <input type="text" id="ytdUserSearch" placeholder="Type to search..." onkeyup="filterCheckboxes('ytdUserCheckboxes', this.value)">
-                    <div class="checkbox-list" id="ytdUserCheckboxes">
-                        {''.join(['<div class="checkbox-item" data-lang="' + user_data["language"] + '"><input type="checkbox" id="ytdUser_' + user_data["username"].replace(" ", "_") + '" value="' + user_data["username"] + '" onchange="applyFilters(' + "'ytd'" + ')"><label for="ytdUser_' + user_data["username"].replace(" ", "_") + '">' + user_data["username"] + '</label></div>' for user_key, user_data in sorted(ytd_users.items(), key=lambda x: x[1]["username"])])}
-                    </div>
-                </div>
-            </div>
-        </div>
-
-        <div class="data-row">
-            <div class="data-card">
-                <h3>🌍 Language Translation Trends</h3>
-                <img class="chart-img" id="ytdLangImg" src="data:image/png;base64,{ytd_lang_chart_b64}" alt="YTD Language Chart">
-                <div class="chart-container" id="ytdLangChartWrap"><canvas id="ytdLanguageChart"></canvas></div>
-            </div>
-            <div class="data-card">
-                <h3>📊 Language Data</h3>
-                <div class="table-container">
-                    <table id="ytdLangTable">
-                        <thead>
-                            <tr>
-                                <th class="sortable" onclick="sortTable('ytdLangTable', 0)">Language</th>
-                                {''.join([f'<th class="number sortable" onclick="sortTable(' + "'ytdLangTable', " + str(idx+1) + ')">' + month + '</th>' for idx, month in enumerate(months)])}
-                                <th class="number sortable" onclick="sortTable('ytdLangTable', {len(months)+1})">Total</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {ytd_lang_table_html}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
-
-        <div class="data-row">
-            <div class="data-card">
-                <h3>👥 User Productivity Trends</h3>
-                <img class="chart-img" id="ytdUserImg" src="data:image/png;base64,{ytd_user_chart_b64}" alt="YTD User Chart">
-                <div class="chart-container" id="ytdUserChartWrap"><canvas id="ytdUserChart"></canvas></div>
-            </div>
-            <div class="data-card">
-                <h3>📊 User Data</h3>
-                <div class="table-container">
-                    <table id="ytdUserTable">
-                        <thead>
-                            <tr>
-                                <th class="sortable" onclick="sortTable('ytdUserTable', 0)">Name</th>
-                                <th class="sortable" onclick="sortTable('ytdUserTable', 1)">Language</th>
-                                {''.join([f'<th class="number sortable" onclick="sortTable(' + "'ytdUserTable', " + str(idx+2) + ')">' + month + '</th>' for idx, month in enumerate(months)])}
-                                <th class="number sortable" onclick="sortTable('ytdUserTable', {len(months)+2})">Total</th>
-                            </tr>
-                        </thead>
-                        <tbody>
-                            {ytd_user_table_html}
-                        </tbody>
-                    </table>
-                </div>
-            </div>
-        </div>
+        {ytd_section_html}
     </div>
 
     <script>
@@ -1695,11 +1899,13 @@ class XTMReportGenerator:
         let monthlyLanguageChart, monthlyUserChart, ytdLanguageChart, ytdUserChart;
         if (typeof Chart !== 'undefined') {{
             // Hide static images, show canvases
-            ['monthlyLangImg','monthlyUserImg','ytdLangImg','ytdUserImg'].forEach(id => {{
+            const imgIds = ['monthlyLangImg','monthlyUserImg'{',' + "'ytdLangImg','ytdUserImg'" if not self.weekly else ''}];
+            imgIds.forEach(id => {{
                 const el = document.getElementById(id);
                 if (el) el.style.display = 'none';
             }});
-            ['monthlyLangChartWrap','monthlyUserChartWrap','ytdLangChartWrap','ytdUserChartWrap'].forEach(id => {{
+            const chartIds = ['monthlyLangChartWrap','monthlyUserChartWrap'{',' + "'ytdLangChartWrap','ytdUserChartWrap'" if not self.weekly else ''}];
+            chartIds.forEach(id => {{
                 const el = document.getElementById(id);
                 if (el) el.style.display = 'block';
             }});
@@ -1724,7 +1930,7 @@ class XTMReportGenerator:
                 }}
             }});
 
-            ytdLanguageChart = new Chart(document.getElementById('ytdLanguageChart'), {{
+            {f"""ytdLanguageChart = new Chart(document.getElementById('ytdLanguageChart'), {{
                 type: 'line',
                 data: {{ labels: {json.dumps(months)}, datasets: {json.dumps(ytd_lang_datasets)} }},
                 options: {{ responsive: true, maintainAspectRatio: false,
@@ -1740,7 +1946,7 @@ class XTMReportGenerator:
                     plugins: {{ title: {{ display: true, text: 'User Productivity' }}, legend: {{ position: 'right', labels: {{ boxWidth: 12, font: {{ size: 9 }} }} }} }},
                     scales: {{ y: {{ beginAtZero: true, ticks: {{ callback: fmtTick }} }} }}
                 }}
-            }});
+            }});""" if not self.weekly else ""}
         }}
 
         function updateChartFromTable(tableId) {{
@@ -2017,7 +2223,8 @@ Please check the log file at:
             subject_escaped = subject.replace('\\', '\\\\').replace('"', '\\"')
             body_escaped = body.replace('\\', '\\\\').replace('"', '\\"')
 
-            recipients = self.config.get('email_recipients', [])
+            # Use error_recipients if specified, otherwise fall back to email_recipients
+            recipients = self.config.get('error_recipients', self.config.get('email_recipients', []))
             if recipients:
                 # Try simple notification email via Mail app
                 recipients_script = ""
@@ -2125,12 +2332,43 @@ Please check the log file at:
 
             # Calculate summary statistics
             monthly_stats = self._calculate_summary_stats(monthly_data)
-            ytd_stats = self._calculate_summary_stats(ytd_data)
 
             # Prepare email content
-            subject = f"XTM Monthly Report - {self.report_month}"
+            if self.weekly:
+                subject = f"XTM Weekly Report - {self.report_week_label}"
+                body = f"""Hello,
 
-            body = f"""Hello,
+Please find attached the XTM weekly report for {self.report_week_label} ({self.report_period}).
+
+Weekly Summary:
+- Total Words Processed: {monthly_stats['total_words']:,}
+- Top Languages:
+{monthly_stats['top_languages']}
+
+Two reports are attached:
+
+1. Interactive HTML Report:
+   • Bar charts showing translation volume by language and workflow step
+   • User productivity bar charts
+   • Sortable tables (click any column header to sort)
+   • Filterable data (use the search boxes to filter by language or user)
+   • Open in your web browser for full interactivity
+
+2. Excel Workbook (.xlsx):
+   • Weekly data sheet with workflow breakdown
+   • User statistics sheet
+   • Built-in bar charts
+   • AutoFilter enabled for easy sorting and filtering
+   • Open in Excel, Google Sheets, or Numbers
+
+Report Generated: {self.report_date.strftime('%Y-%m-%d %H:%M')}
+
+Best regards
+"""
+            else:
+                ytd_stats = self._calculate_summary_stats(ytd_data)
+                subject = f"XTM Monthly Report - {self.report_month}"
+                body = f"""Hello,
 
 Please find attached the XTM monthly report for {self.report_month}.
 
@@ -2172,20 +2410,24 @@ Best regards
             html_path_posix = Path(html_path).as_posix()
             excel_path_posix = Path(excel_path).as_posix()
 
-            recipients = self.config['email_recipients']
+            # Use weekly_recipients for weekly reports, email_recipients for monthly
+            if self.weekly:
+                recipients = self.config.get('weekly_recipients', self.config['email_recipients'])
+            else:
+                recipients = self.config['email_recipients']
 
             # Try Microsoft Outlook first (already ensured it's running if auto_send)
             outlook_result = self._create_outlook_email_mac(subject_escaped, body_escaped, recipients,
                                                            html_path_posix, excel_path_posix)
             if outlook_result:
-                return
+                return len(recipients)
 
             # Fall back to Apple Mail
             logger.info("Microsoft Outlook not available, trying Apple Mail")
             apple_result = self._create_apple_mail_email(subject_escaped, body_escaped, recipients,
                                                         html_path_posix, excel_path_posix)
             if apple_result:
-                return
+                return len(recipients)
 
             # If both fail, just open the reports
             logger.warning("Could not create email draft. Opening report files.")
@@ -2321,37 +2563,57 @@ Best regards
             return False
 
     def generate_report(self):
-        """Main method to generate and distribute the HTML report."""
+        """Main method to generate and distribute the HTML/Excel report."""
         html_path = None
         try:
-            logger.info("Starting XTM monthly report generation")
+            if self.weekly:
+                logger.info(f"Starting XTM weekly report generation for {self.report_week_label}")
+            else:
+                logger.info("Starting XTM monthly report generation")
 
             # Run health checks
             self._run_health_checks()
 
-            # Query API for current month data
-            try:
-                monthly_data = self.aggregate_monthly_data(self.report_month, self.report_month)
-                # Cache for future runs
-                self._save_month_cache(self.report_month, monthly_data)
-            except Exception as e:
-                logger.error(f"Failed to aggregate monthly data: {e}", exc_info=True)
-                monthly_data = {
-                    'project_stats': {'total': 0, 'completed': 0, 'in_progress': 0, 'pending': 0},
-                    'workflow_by_language': {},
-                    'user_statistics': {},
-                    'projects': []
-                }
+            if self.weekly:
+                # Query API for weekly data
+                try:
+                    weekly_data = self.aggregate_weekly_data(self.report_start_date, self.report_end_date)
+                except Exception as e:
+                    logger.error(f"Failed to aggregate weekly data: {e}", exc_info=True)
+                    weekly_data = {
+                        'project_stats': {'total': 0, 'completed': 0, 'in_progress': 0, 'pending': 0},
+                        'workflow_by_language': {},
+                        'user_statistics': {},
+                        'projects': []
+                    }
 
-            # Aggregate YTD data (reuses monthly_data for current month, cache for past months)
-            try:
-                ytd_monthly_breakdown = self.aggregate_ytd_data(
-                    self.ytd_start_month, self.ytd_end_month,
-                    current_month_data=monthly_data
-                )
-            except Exception as e:
-                logger.error(f"Failed to aggregate YTD data: {e}", exc_info=True)
+                monthly_data = weekly_data
+                # No YTD for weekly reports
                 ytd_monthly_breakdown = {'months': [], 'languages': {}, 'users': {}}
+            else:
+                # Query API for current month data
+                try:
+                    monthly_data = self.aggregate_monthly_data(self.report_month, self.report_month)
+                    # Cache for future runs
+                    self._save_month_cache(self.report_month, monthly_data)
+                except Exception as e:
+                    logger.error(f"Failed to aggregate monthly data: {e}", exc_info=True)
+                    monthly_data = {
+                        'project_stats': {'total': 0, 'completed': 0, 'in_progress': 0, 'pending': 0},
+                        'workflow_by_language': {},
+                        'user_statistics': {},
+                        'projects': []
+                    }
+
+                # Aggregate YTD data (reuses monthly_data for current month, cache for past months)
+                try:
+                    ytd_monthly_breakdown = self.aggregate_ytd_data(
+                        self.ytd_start_month, self.ytd_end_month,
+                        current_month_data=monthly_data
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to aggregate YTD data: {e}", exc_info=True)
+                    ytd_monthly_breakdown = {'months': [], 'languages': {}, 'users': {}}
 
             if not (monthly_data.get('workflow_by_language') or ytd_monthly_breakdown.get('languages')):
                 logger.warning("No data available for reporting period")
@@ -2363,14 +2625,19 @@ Best regards
             except Exception as e:
                 logger.warning(f"Could not create output directory: {e}")
 
-            # Create HTML report
-            html_filename = f"XTM_Report_{self.report_month}_{self.report_date.strftime('%Y%m%d')}.html"
+            # Create HTML and Excel reports with appropriate naming
+            if self.weekly:
+                report_label = f"Weekly_Report_{self.report_week_label.replace('Week of ', '')}"
+                html_filename = f"XTM_{report_label}_{self.report_date.strftime('%Y%m%d')}.html"
+                excel_filename = f"XTM_{report_label}_{self.report_date.strftime('%Y%m%d')}.xlsx"
+            else:
+                html_filename = f"XTM_Report_{self.report_month}_{self.report_date.strftime('%Y%m%d')}.html"
+                excel_filename = f"XTM_Report_{self.report_month}_{self.report_date.strftime('%Y%m%d')}.xlsx"
+
             html_path = str(output_dir / html_filename)
             self.create_combined_html_report(monthly_data, ytd_monthly_breakdown, html_path)
             logger.info(f"Combined HTML report saved to {html_path}")
 
-            # Create Excel report
-            excel_filename = f"XTM_Report_{self.report_month}_{self.report_date.strftime('%Y%m%d')}.xlsx"
             excel_path = str(output_dir / excel_filename)
             self.create_excel_report(monthly_data, ytd_monthly_breakdown, excel_path)
             logger.info(f"Excel report saved to {excel_path}")
@@ -2391,8 +2658,9 @@ Best regards
                 }
 
             # Send via Outlook
+            recipient_count = 0
             try:
-                self.send_email_via_outlook(html_path, excel_path, monthly_data, ytd_data)
+                recipient_count = self.send_email_via_outlook(html_path, excel_path, monthly_data, ytd_data)
                 email_success = True
             except Exception as e:
                 logger.error(f"Failed to send email: {e}", exc_info=True)
@@ -2402,12 +2670,15 @@ Best regards
             print(f"\n✓ Reports generated:")
             print(f"  - HTML: {html_path}")
             print(f"  - Excel: {excel_path}")
-            print(f"✓ Period: {self.report_month} (YTD: {self.ytd_start_month} to {self.ytd_end_month})")
+            if self.weekly:
+                print(f"✓ Period: {self.report_period}")
+            else:
+                print(f"✓ Period: {self.report_month} (YTD: {self.ytd_start_month} to {self.ytd_end_month})")
             if email_success:
                 if self.auto_send:
-                    print(f"✓ Email sent automatically to {len(self.config['email_recipients'])} recipients")
+                    print(f"✓ Email sent automatically to {recipient_count} recipient{'s' if recipient_count != 1 else ''}")
                 else:
-                    print(f"✓ Email draft created with {len(self.config['email_recipients'])} recipients")
+                    print(f"✓ Email draft created with {recipient_count} recipient{'s' if recipient_count != 1 else ''}")
             else:
                 print(f"⚠ Email could not be sent - reports saved locally")
 
@@ -2424,13 +2695,15 @@ def main():
     """Main entry point."""
     import argparse
 
-    parser = argparse.ArgumentParser(description='Generate XTM monthly report')
+    parser = argparse.ArgumentParser(description='Generate XTM report (monthly or weekly)')
     parser.add_argument('--auto-send', action='store_true',
                        help='Automatically send email (default: create draft only)')
+    parser.add_argument('--weekly', action='store_true',
+                       help='Generate weekly report for previous 7 days (default: monthly report)')
     args = parser.parse_args()
 
     try:
-        generator = XTMReportGenerator(auto_send=args.auto_send)
+        generator = XTMReportGenerator(auto_send=args.auto_send, weekly=args.weekly)
         generator.generate_report()
     except Exception as e:
         logger.error(f"Fatal error: {e}")

@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.xtm.weeklyreport</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/Users/jayjay5032/MartinMonthlyReport/generate_report.py</string>
+        <string>--weekly</string>
+        <string>--auto-send</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/jayjay5032/MartinMonthlyReport</string>
+
+    <!-- Run every Monday at 9:00 AM -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>9</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>StandardOutPath</key>
+    <string>/Users/jayjay5032/MartinMonthlyReport/xtm_weekly_report.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/jayjay5032/MartinMonthlyReport/xtm_weekly_report_error.log</string>
+
+    <!-- Run even when user is not logged in -->
+    <key>RunAtLoad</key>
+    <false/>
+
+    <!-- Set nice value to run with lower priority -->
+    <key>Nice</key>
+    <integer>1</integer>
+
+    <!-- Set process timeout to 30 minutes -->
+    <key>ExitTimeOut</key>
+    <integer>1800</integer>
+
+    <!-- Environment variables -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+    </dict>
+</dict>
+</plist>

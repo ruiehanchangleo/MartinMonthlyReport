@@ -4,18 +4,24 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-Automated monthly reporting system for XTM Cloud translation management. Generates both HTML and Excel reports with translation metrics, excludes specific users, converts locale codes to readable language names, and emails reports via Microsoft Outlook.
+Automated reporting system for XTM Cloud translation management. Generates both HTML and Excel reports with translation metrics, excludes specific users, converts locale codes to readable language names, and emails reports via Microsoft Outlook. Supports both monthly reports (with YTD data) and weekly reports (previous 7 days).
 
 ## Core Commands
 
 ### Generate Reports
 
 ```bash
-# Generate report with draft email (for review)
+# Monthly report with draft email (for review)
 python3 generate_report.py
 
-# Generate and automatically send email via Outlook
+# Monthly report - automatically send email via Outlook
 python3 generate_report.py --auto-send
+
+# Weekly report (previous 7 days) with draft email
+python3 generate_report.py --weekly
+
+# Weekly report - automatically send email via Outlook
+python3 generate_report.py --weekly --auto-send
 
 # Debug: View user statistics (shows all users including excluded ones)
 python3 debug_user_stats.py
@@ -36,8 +42,14 @@ python3 test_single_project.py
 # Set up monthly automated sending (1st of month at 9:00 AM)
 ./setup_schedule.sh
 
-# Test the automation configuration
+# Set up weekly automated sending (every Monday at 9:00 AM)
+./setup_weekly_schedule.sh
+
+# Test the monthly automation configuration
 ./test_automation.sh
+
+# Test the weekly report generation
+./test_weekly_report.sh
 
 # Test resilience features (retry, health checks, etc.)
 python3 test_resilience.py
@@ -45,8 +57,11 @@ python3 test_resilience.py
 # Check if automation is running
 launchctl list | grep xtm
 
-# View logs
+# View monthly logs
 tail -f xtm_report.log
+
+# View weekly logs
+tail -f xtm_weekly_report.log
 ```
 
 ### Resilience Features
@@ -167,6 +182,8 @@ The automation includes multiple layers of error handling to ensure it never fai
 
 **com.xtm.monthlyreport.plist**: LaunchAgent configuration for monthly scheduling (1st of month at 9:00 AM).
 
+**com.xtm.weeklyreport.plist**: LaunchAgent configuration for weekly scheduling (every Monday at 9:00 AM).
+
 **xtm-docs.json**: Complete XTM REST API OpenAPI 3.0 specification (688KB).
 
 ## Utility Scripts
@@ -207,7 +224,7 @@ Steps not in this list will appear after these (sorted alphabetically).
 
 ### Date Range
 
-The script reports on the **previous complete month**. When run on February 1st, it generates January's complete data. When run on March 1st, it generates February's complete data. Month is calculated in `__init__()`:
+**Monthly Reports**: The script reports on the **previous complete month**. When run on February 1st, it generates January's complete data. When run on March 1st, it generates February's complete data. Month is calculated in `__init__()`:
 ```python
 first_day_current_month = self.report_date.replace(day=1)
 last_day_previous_month = first_day_current_month - timedelta(days=1)
@@ -216,16 +233,37 @@ self.report_month = last_day_previous_month.strftime('%Y-%m')
 
 The Year-to-Date report covers January through the end of the previous month.
 
+**Weekly Reports**: When using `--weekly` flag, the script reports on the **previous 7 days**. When run on Monday, it covers the previous 7 days (ending yesterday). Calculated in `__init__()`:
+```python
+end_date = self.report_date - timedelta(days=1)  # Yesterday
+start_date = end_date - timedelta(days=6)  # 7 days total including end_date
+```
+
+Weekly reports include:
+- HTML report with charts and filterable tables
+- Excel workbook with weekly data sheet and user statistics
+- Email subject: "XTM Weekly Report - Week of YYYY-MM-DD"
+- File naming: `XTM_Weekly_Report_YYYY-MM-DD_<generation_date>.html/xlsx`
+
+Weekly reports do NOT include YTD data (only the weekly period).
+
 ### Email Body
 
-Email content is defined in `send_email_via_outlook()`. Includes monthly summary, YTD summary, and top 3 languages for each period.
+Email content is defined in `send_email_via_outlook()`. 
+- **Monthly**: Includes monthly summary, YTD summary, and top 3 languages for each period
+- **Weekly**: Includes only weekly summary and top 3 languages for the week
 
 ## Logs
 
+**Monthly Reports:**
 - **xtm_report.log**: All operations (INFO level and above)
 - **xtm_report_error.log**: Errors only (from LaunchAgent stderr)
 
-Both files are in the project root directory.
+**Weekly Reports:**
+- **xtm_weekly_report.log**: All operations (INFO level and above)
+- **xtm_weekly_report_error.log**: Errors only (from LaunchAgent stderr)
+
+All log files are in the project root directory.
 
 ## Security
 
