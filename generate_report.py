@@ -152,6 +152,9 @@ class XTMReportGenerator:
         'swa': 'Swahili',
         'th_TH': 'Thai',
         'tl_PH': 'Tagalog',
+        'tl': 'Tagalog',
+        'fil_PH': 'Tagalog',
+        'fil': 'Tagalog',
         'to_TO': 'Tongan',
         'tr_TR': 'Turkish',
         'ty': 'Tahitian',
@@ -161,23 +164,25 @@ class XTMReportGenerator:
         'zh_CN': 'Chinese (Simplified)',
         'zh_HK': 'Chinese (Hong Kong)',
         'zh_TW': 'Chinese (Traditional)',
+        'es_419': 'Spanish (Latin America)',
+        'tr': 'Turkish',
     }
 
-    # Email domains to exclude (all users from these domains are filtered out)
-    EXCLUDED_DOMAINS = [
-        "familysearch.org",
-        "churchofjesuschrist.org",
-        "brightspot.com",
-        "xtm-intl.com"
-    ]
-
-    # Additional specific users to exclude (non-email usernames)
+    # Accounts to exclude, matched against the XTM `username` field ONLY (case-insensitive).
+    # Display names, firstName/lastName, and email domains are intentionally NOT considered.
     EXCLUDED_USERS = [
+        "BreaB@familysearch.org",
+        "BSP",
+        "BSP_Tester",
         "LeoAdmin",
+        "lingoport",
         "MartinADMIN",
-        "Tester BSP BSP",
-        "BSP BSP Tester",
-        "BSP_Tester"
+        "FS Linguist",
+        "thelinguist",
+        "testuser@gmail.com",
+        "DummyUser",
+        "xtmsupport",
+        "XTM TM import API",
     ]
 
     def __init__(self, config_path: str = "xtm_config.json", auto_send: bool = False, weekly: bool = False):
@@ -441,54 +446,28 @@ class XTMReportGenerator:
             return {}
 
     def _is_excluded_user(self, user_stat: Dict) -> bool:
-        """Check if a user should be excluded based on email domain or specific username."""
+        """Check if a user should be excluded, matching the `username` field only (case-insensitive)."""
         username = user_stat.get('username', '').lower()
-        display_name = user_stat.get('userDisplayName', '').lower()
+        if not username:
+            return False
 
-        # Check if username (email) ends with any excluded domain
-        for domain in self.EXCLUDED_DOMAINS:
-            if username.endswith(f"@{domain.lower()}"):
-                return True
-
-        # Check against specific excluded usernames
         excluded_lower = [u.lower() for u in self.EXCLUDED_USERS]
-
-        # Check all possible name fields
-        fields_to_check = [
-            username,
-            display_name,
-        ]
-
-        # Also check firstName + lastName combination
-        first_name = user_stat.get('firstName', '').strip()
-        last_name = user_stat.get('lastName', '').strip()
-        if first_name and last_name:
-            fields_to_check.append(f"{first_name} {last_name}".lower())
-        if first_name:
-            fields_to_check.append(first_name.lower())
-        if last_name:
-            fields_to_check.append(last_name.lower())
-
-        return any(field in excluded_lower for field in fields_to_check if field)
+        return username in excluded_lower
 
     @staticmethod
     def _resolve_user_name(user_stat: Dict) -> str:
-        """Extract the best display name from a user statistics entry."""
-        first_name = user_stat.get('firstName', '').strip()
-        last_name = user_stat.get('lastName', '').strip()
-
-        if first_name and last_name:
-            return f"{first_name} {last_name}"
-        if first_name:
-            return first_name
-        if last_name:
-            return last_name
-
-        # Fall back to display name or email
+        """
+        Extract the best display name from a user statistics entry.
+        Uses userDisplayName as-is (no reversal) since XTM API doesn't provide firstName/lastName.
+        """
+        # Use userDisplayName directly - DO NOT reverse the name
+        # XTM displays names in various formats, we preserve them as-is
         username = user_stat.get('userDisplayName', user_stat.get('username', 'Unknown'))
+
         # Strip "generic " prefix from XTM display names
         if username.lower().startswith('generic '):
             username = username[8:]
+
         return username
 
     def get_project_statistics(self, project_id: int):
@@ -629,6 +608,130 @@ class XTMReportGenerator:
                                 job_step_dates[job_id][step_name.lower()] = finish_date
 
             # Process each target language
+            # Check if statistics are empty (archived project)
+            if not stats_list or len(stats_list) == 0:
+                # Project is likely archived - try metrics endpoint as fallback
+                logger.info(f"Project {project_id} has no statistics (likely archived), using metrics fallback")
+
+                # Use metrics endpoint to get word counts
+                metrics = self.get_project_metrics(project_id)
+
+                if metrics and len(metrics) > 0:
+                    project_total_words = 0
+                    project_has_work_in_period = False
+                    target_languages = []
+
+                    for metric in metrics:
+                        target_lang_code = metric.get('targetLanguage', 'unknown')
+                        target_lang_name = self._locale_to_language_name(target_lang_code)
+
+                        # Get step-level metrics
+                        metrics_progress = metric.get('metricsProgress', {})
+
+                        for step_name, step_metrics in metrics_progress.items():
+                            words_done = step_metrics.get('wordsDone', 0)
+
+                            if words_done > 0:
+                                # Clean step name - remove digits and normalize to lowercase
+                                clean_step_name = ''.join([c for c in step_name if not c.isdigit()]).strip().lower()
+
+                                # Archived projects only expose a single cumulative
+                                # wordsDone per language+step (no per-job words). To avoid
+                                # double-counting, attribute that cumulative total to the
+                                # ONE month in which the step was *fully* completed for this
+                                # language — i.e. the latest finish date across the
+                                # language's jobs for this step. The previous "any job that
+                                # finished in this period" test re-added the same cumulative
+                                # words in every month a job happened to finish, inflating
+                                # YTD totals.
+                                step_completed_in_period = False
+                                step_finish_dates = []
+                                if project_status:
+                                    for job in project_status.get('jobs', []):
+                                        if job.get('targetLanguage') == target_lang_code:
+                                            for step in job.get('steps', []):
+                                                if step.get('workflowStepName', '').lower() == step_name.lower():
+                                                    finish_date_ts = step.get('finishDate')
+                                                    if finish_date_ts:
+                                                        step_finish_dates.append(finish_date_ts)
+
+                                if step_finish_dates:
+                                    completion_date = datetime.fromtimestamp(max(step_finish_dates) / 1000)
+                                    if start_date <= completion_date < end_date:
+                                        step_completed_in_period = True
+
+                                if step_completed_in_period:
+                                    project_has_work_in_period = True
+
+                                    if target_lang_name not in target_languages:
+                                        target_languages.append(target_lang_name)
+
+                                    # Use generic "Archived User" for attribution
+                                    username = "Archived User"
+
+                                    # Track user statistics
+                                    user_key = f"{username}|{target_lang_name}"
+                                    if user_key not in data['user_statistics']:
+                                        data['user_statistics'][user_key] = {
+                                            'user': username,
+                                            'language': target_lang_name,
+                                            'workflow_steps': {}
+                                        }
+
+                                    # Add words to this user's workflow step
+                                    if clean_step_name not in data['user_statistics'][user_key]['workflow_steps']:
+                                        data['user_statistics'][user_key]['workflow_steps'][clean_step_name] = 0
+                                    data['user_statistics'][user_key]['workflow_steps'][clean_step_name] += words_done
+
+                                    # Create unique key for workflow step + language
+                                    workflow_key = f"{clean_step_name} - {target_lang_name}"
+
+                                    if workflow_key not in data['workflow_by_language']:
+                                        data['workflow_by_language'][workflow_key] = {
+                                            'workflow_step': clean_step_name,
+                                            'language': target_lang_name,
+                                            'words_done': 0,
+                                            'words_to_be_done': 0,
+                                            'projects': 0
+                                        }
+
+                                    data['workflow_by_language'][workflow_key]['words_done'] += words_done
+                                    project_total_words += words_done
+
+                    # Add project to stats if it has work in the target period
+                    if project_has_work_in_period and project_total_words > 0:
+                        data['project_stats']['total'] += 1
+                        status = project.get('status', 'UNKNOWN')
+
+                        if status == 'FINISHED':
+                            data['project_stats']['completed'] += 1
+                        elif status in ['IN_PROGRESS', 'STARTED']:
+                            data['project_stats']['in_progress'] += 1
+                        else:
+                            data['project_stats']['pending'] += 1
+
+                        # Mark projects for each language/workflow combination
+                        for target_lang_name in target_languages:
+                            for workflow_key in data['workflow_by_language'].keys():
+                                if workflow_key.endswith(f" - {target_lang_name}"):
+                                    data['workflow_by_language'][workflow_key]['projects'] = data['workflow_by_language'][workflow_key].get('projects', 0) + 1
+
+                        # Store project summary
+                        data['projects'].append({
+                            'id': project_id,
+                            'name': project.get('name', 'Unknown'),
+                            'status': status,
+                            'source_lang': 'en_US',
+                            'target_langs': ', '.join(target_languages),
+                            'total_words': project_total_words,
+                            'created_date': None
+                        })
+
+                        logger.info(f"Added archived project {project_id} with {project_total_words} words from metrics")
+
+                # Skip normal processing since we used metrics fallback
+                continue
+
             if isinstance(stats_list, list) and stats_list:
                 project_total_words = 0
                 project_has_work_in_period = False
@@ -648,8 +751,8 @@ class XTMReportGenerator:
                         # Process each workflow step
                         for step_stat in steps_statistics:
                             step_name = step_stat.get('workflowStepName', '')
-                            # Remove numbers from step name
-                            clean_step_name = ''.join([c for c in step_name if not c.isdigit()])
+                            # Remove numbers from step name and normalize to lowercase
+                            clean_step_name = ''.join([c for c in step_name if not c.isdigit()]).strip().lower()
 
                             jobs_statistics = step_stat.get('jobsStatistics', [])
 
@@ -751,14 +854,15 @@ class XTMReportGenerator:
         return data
 
     def _get_cache_path(self, month: str) -> Path:
-        """Get the JSON cache file path for a month."""
-        return Path(self.config['onedrive_path']) / f".cache_monthly_{month}.json"
+        """Get the JSON cache file path for a month (stored locally, not on OneDrive)."""
+        cache_dir = Path(__file__).parent / ".cache"
+        cache_dir.mkdir(exist_ok=True)
+        return cache_dir / f"monthly_{month}.json"
 
     def _save_month_cache(self, month: str, month_data: Dict):
         """Save processed monthly data to JSON cache."""
         cache_path = self._get_cache_path(month)
         try:
-            # Extract only the serializable parts we need
             cache = {
                 'languages': {},
                 'users': {}
@@ -857,6 +961,114 @@ class XTMReportGenerator:
                             if finish_date and step_name:
                                 job_step_dates[job_id][step_name.lower()] = finish_date
 
+            # Check if statistics are empty (archived project)
+            if not stats_list or len(stats_list) == 0:
+                logger.info(f"Project {project_id} has no statistics (likely archived), using metrics fallback")
+
+                metrics = self.get_project_metrics(project_id)
+
+                if metrics and len(metrics) > 0:
+                    project_total_words = 0
+                    project_has_work_in_period = False
+                    target_languages = []
+
+                    for metric in metrics:
+                        target_lang_code = metric.get('targetLanguage', 'unknown')
+                        target_lang_name = self._locale_to_language_name(target_lang_code)
+
+                        metrics_progress = metric.get('metricsProgress', {})
+
+                        for step_name, step_metrics in metrics_progress.items():
+                            words_done = step_metrics.get('wordsDone', 0)
+
+                            if words_done > 0:
+                                clean_step_name = ''.join([c for c in step_name if not c.isdigit()]).strip().lower()
+
+                                # Attribute the cumulative wordsDone to the single period in
+                                # which the step was fully completed (latest finish date
+                                # across the language's jobs), rather than re-counting it for
+                                # every job that finished in the window. See the matching note
+                                # in aggregate_monthly_data().
+                                step_completed_in_period = False
+                                step_finish_dates = []
+                                if project_status:
+                                    for job in project_status.get('jobs', []):
+                                        if job.get('targetLanguage') == target_lang_code:
+                                            for step in job.get('steps', []):
+                                                if step.get('workflowStepName', '').lower() == step_name.lower():
+                                                    finish_date_ts = step.get('finishDate')
+                                                    if finish_date_ts:
+                                                        step_finish_dates.append(finish_date_ts)
+
+                                if step_finish_dates:
+                                    completion_date = datetime.fromtimestamp(max(step_finish_dates) / 1000)
+                                    if start_date <= completion_date <= end_date:
+                                        step_completed_in_period = True
+
+                                if step_completed_in_period:
+                                    project_has_work_in_period = True
+
+                                    if target_lang_name not in target_languages:
+                                        target_languages.append(target_lang_name)
+
+                                    username = "Archived User"
+
+                                    user_key = f"{username}|{target_lang_name}"
+                                    if user_key not in data['user_statistics']:
+                                        data['user_statistics'][user_key] = {
+                                            'user': username,
+                                            'language': target_lang_name,
+                                            'workflow_steps': {}
+                                        }
+
+                                    if clean_step_name not in data['user_statistics'][user_key]['workflow_steps']:
+                                        data['user_statistics'][user_key]['workflow_steps'][clean_step_name] = 0
+                                    data['user_statistics'][user_key]['workflow_steps'][clean_step_name] += words_done
+
+                                    workflow_key = f"{clean_step_name} - {target_lang_name}"
+
+                                    if workflow_key not in data['workflow_by_language']:
+                                        data['workflow_by_language'][workflow_key] = {
+                                            'workflow_step': clean_step_name,
+                                            'language': target_lang_name,
+                                            'words_done': 0,
+                                            'words_to_be_done': 0,
+                                            'projects': 0
+                                        }
+
+                                    data['workflow_by_language'][workflow_key]['words_done'] += words_done
+                                    project_total_words += words_done
+
+                    if project_has_work_in_period and project_total_words > 0:
+                        data['project_stats']['total'] += 1
+                        status = project.get('status', 'UNKNOWN')
+
+                        if status == 'FINISHED':
+                            data['project_stats']['completed'] += 1
+                        elif status in ['IN_PROGRESS', 'STARTED']:
+                            data['project_stats']['in_progress'] += 1
+                        else:
+                            data['project_stats']['pending'] += 1
+
+                        for target_lang_name in target_languages:
+                            for workflow_key in data['workflow_by_language'].keys():
+                                if workflow_key.endswith(f" - {target_lang_name}"):
+                                    data['workflow_by_language'][workflow_key]['projects'] = data['workflow_by_language'][workflow_key].get('projects', 0) + 1
+
+                        data['projects'].append({
+                            'id': project_id,
+                            'name': project.get('name', 'Unknown'),
+                            'status': status,
+                            'source_lang': 'en_US',
+                            'target_langs': ', '.join(target_languages),
+                            'total_words': project_total_words,
+                            'created_date': None
+                        })
+
+                        logger.info(f"Added archived project {project_id} with {project_total_words} words from metrics")
+
+                continue
+
             if isinstance(stats_list, list) and stats_list:
                 project_total_words = 0
                 project_has_work_in_period = False
@@ -872,7 +1084,8 @@ class XTMReportGenerator:
 
                         for step_stat in steps_statistics:
                             step_name = step_stat.get('workflowStepName', '')
-                            clean_step_name = ''.join([c for c in step_name if not c.isdigit()])
+                            # Remove numbers and normalize to lowercase
+                            clean_step_name = ''.join([c for c in step_name if not c.isdigit()]).strip().lower()
                             jobs_statistics = step_stat.get('jobsStatistics', [])
 
                             for job_stat in jobs_statistics:
@@ -1735,6 +1948,28 @@ class XTMReportGenerator:
         else:
             ytd_section_html = ""
 
+        # Build YTD chart JS separately to avoid nested f-strings (those require Python 3.12+; launchd runs Python 3.9)
+        if not self.weekly:
+            ytd_charts_js = f"""ytdLanguageChart = new Chart(document.getElementById('ytdLanguageChart'), {{
+                type: 'line',
+                data: {{ labels: {json.dumps(months)}, datasets: {json.dumps(ytd_lang_datasets)} }},
+                options: {{ responsive: true, maintainAspectRatio: false,
+                    plugins: {{ title: {{ display: true, text: 'Language Trends' }}, legend: {{ position: 'right', labels: {{ boxWidth: 12, font: {{ size: 9 }} }} }} }},
+                    scales: {{ y: {{ beginAtZero: true, ticks: {{ callback: fmtTick }} }} }}
+                }}
+            }});
+
+            ytdUserChart = new Chart(document.getElementById('ytdUserChart'), {{
+                type: 'line',
+                data: {{ labels: {json.dumps(months)}, datasets: {json.dumps(ytd_user_datasets)} }},
+                options: {{ responsive: true, maintainAspectRatio: false,
+                    plugins: {{ title: {{ display: true, text: 'User Productivity' }}, legend: {{ position: 'right', labels: {{ boxWidth: 12, font: {{ size: 9 }} }} }} }},
+                    scales: {{ y: {{ beginAtZero: true, ticks: {{ callback: fmtTick }} }} }}
+                }}
+            }});"""
+        else:
+            ytd_charts_js = ""
+
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -1930,31 +2165,26 @@ class XTMReportGenerator:
                 }}
             }});
 
-            {f"""ytdLanguageChart = new Chart(document.getElementById('ytdLanguageChart'), {{
-                type: 'line',
-                data: {{ labels: {json.dumps(months)}, datasets: {json.dumps(ytd_lang_datasets)} }},
-                options: {{ responsive: true, maintainAspectRatio: false,
-                    plugins: {{ title: {{ display: true, text: 'Language Trends' }}, legend: {{ position: 'right', labels: {{ boxWidth: 12, font: {{ size: 9 }} }} }} }},
-                    scales: {{ y: {{ beginAtZero: true, ticks: {{ callback: fmtTick }} }} }}
-                }}
-            }});
-
-            ytdUserChart = new Chart(document.getElementById('ytdUserChart'), {{
-                type: 'line',
-                data: {{ labels: {json.dumps(months)}, datasets: {json.dumps(ytd_user_datasets)} }},
-                options: {{ responsive: true, maintainAspectRatio: false,
-                    plugins: {{ title: {{ display: true, text: 'User Productivity' }}, legend: {{ position: 'right', labels: {{ boxWidth: 12, font: {{ size: 9 }} }} }} }},
-                    scales: {{ y: {{ beginAtZero: true, ticks: {{ callback: fmtTick }} }} }}
-                }}
-            }});""" if not self.weekly else ""}
+            {ytd_charts_js}
         }}
 
         function updateChartFromTable(tableId) {{
             if (typeof Chart === 'undefined') return;
             const table = document.getElementById(tableId);
             const rows = table.querySelectorAll('tbody tr');
+            // User charts are labeled "Name (Language)"; rebuild the same identity from the
+            // table so a user appears only for the language(s) currently visible. Language
+            // charts are labeled by language alone, which matches cell[0] directly.
+            const isUserTable = tableId.endsWith('UserTable');
             const visibleLabels = [];
-            rows.forEach(row => {{ if (row.style.display !== 'none') visibleLabels.push(row.cells[0].textContent.trim()); }});
+            rows.forEach(row => {{
+                if (row.style.display === 'none') return;
+                if (isUserTable) {{
+                    visibleLabels.push(row.cells[0].textContent.trim() + ' (' + row.cells[1].textContent.trim() + ')');
+                }} else {{
+                    visibleLabels.push(row.cells[0].textContent.trim());
+                }}
+            }});
 
             if (tableId === 'monthlyLangTable') updateBarChart(monthlyLanguageChart, {json.dumps(monthly_lang_labels)}, {json.dumps(monthly_workflow_datasets)}, visibleLabels);
             else if (tableId === 'monthlyUserTable') updateBarChart(monthlyUserChart, {json.dumps(monthly_user_labels)}, [{{ label: 'Total Words', data: {json.dumps(monthly_user_data_points)}, backgroundColor: '#36A2EB' }}], visibleLabels);
@@ -1964,7 +2194,7 @@ class XTMReportGenerator:
 
         function updateBarChart(chart, allLabels, allDatasets, visibleLabels) {{
             if (!chart) return;
-            const idx = []; allLabels.forEach((l, i) => {{ if (visibleLabels.some(v => l.includes(v) || v.includes(l))) idx.push(i); }});
+            const idx = []; allLabels.forEach((l, i) => {{ if (visibleLabels.includes(l)) idx.push(i); }});
             chart.data.labels = idx.map(i => allLabels[i]);
             chart.data.datasets = allDatasets.map(ds => ({{ ...ds, data: idx.map(i => ds.data[i]) }}));
             chart.update();
@@ -1972,7 +2202,7 @@ class XTMReportGenerator:
 
         function updateLineChart(chart, allDatasets, visibleLabels) {{
             if (!chart) return;
-            chart.data.datasets = allDatasets.filter(ds => {{ const n = ds.label.split(' (')[0]; return visibleLabels.some(v => v === ds.label || v === n || ds.label.includes(v)); }});
+            chart.data.datasets = allDatasets.filter(ds => visibleLabels.includes(ds.label));
             chart.update();
         }}
 
@@ -2634,13 +2864,31 @@ Best regards
                 html_filename = f"XTM_Report_{self.report_month}_{self.report_date.strftime('%Y%m%d')}.html"
                 excel_filename = f"XTM_Report_{self.report_month}_{self.report_date.strftime('%Y%m%d')}.xlsx"
 
-            html_path = str(output_dir / html_filename)
-            self.create_combined_html_report(monthly_data, ytd_monthly_breakdown, html_path)
-            logger.info(f"Combined HTML report saved to {html_path}")
+            # Save locally first (reliable), then copy to OneDrive
+            local_dir = Path(__file__).parent / "output"
+            local_dir.mkdir(exist_ok=True)
 
+            local_html_path = str(local_dir / html_filename)
+            local_excel_path = str(local_dir / excel_filename)
+
+            self.create_combined_html_report(monthly_data, ytd_monthly_breakdown, local_html_path)
+            logger.info(f"Combined HTML report saved to {local_html_path}")
+
+            self.create_excel_report(monthly_data, ytd_monthly_breakdown, local_excel_path)
+            logger.info(f"Excel report saved to {local_excel_path}")
+
+            # Copy to OneDrive (best-effort)
+            html_path = str(output_dir / html_filename)
             excel_path = str(output_dir / excel_filename)
-            self.create_excel_report(monthly_data, ytd_monthly_breakdown, excel_path)
-            logger.info(f"Excel report saved to {excel_path}")
+            import shutil
+            try:
+                shutil.copy2(local_html_path, html_path)
+                shutil.copy2(local_excel_path, excel_path)
+                logger.info(f"Reports copied to OneDrive: {output_dir}")
+            except Exception as e:
+                logger.warning(f"Could not copy to OneDrive (files saved locally): {e}")
+                html_path = local_html_path
+                excel_path = local_excel_path
 
             # Construct a minimal ytd_data for the email body stats
             ytd_data = {
