@@ -26,5 +26,7 @@ ENV/
 .DS_Store
 Thumbs.db
 
-# Excel reports (generated files)
+# Generated reports and cached data (regenerated on each run)
 *.xlsx
+.cache/
+output/
