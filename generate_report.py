@@ -386,17 +386,49 @@ class XTMReportGenerator:
                 logger.error(f"API request failed: {e}")
             raise
 
-    def get_projects(self, status: str = None) -> List[Dict]:
-        """Retrieve projects from XTM API."""
+    # XTM list endpoints cap each response at pageSize (max 1000) and require
+    # paging to get everything. _fetch_all_pages loops until a short page so we
+    # never silently truncate (the bug that hid 800+ projects). MAX_PAGES is a
+    # safety stop against an unexpected infinite loop.
+    MAX_PAGES = 100
+
+    def _fetch_all_pages(self, endpoint: str, params: Dict = None, page_size: int = 1000) -> List[Dict]:
+        """Fetch every page of a paginated XTM list endpoint into one list."""
+        results = []
+        params = dict(params or {})
+        for page in range(1, self.MAX_PAGES + 1):
+            params['page'] = page
+            params['pageSize'] = page_size
+            batch = self._make_request(endpoint, params=params)
+            if not isinstance(batch, list) or not batch:
+                break
+            results.extend(batch)
+            if len(batch) < page_size:
+                break
+            if page == self.MAX_PAGES:
+                logger.warning(f"{endpoint}: hit MAX_PAGES={self.MAX_PAGES} cap; "
+                               f"results may be truncated — raise MAX_PAGES")
+        return results
+
+    def get_projects(self, status: str = None, modified_from: str = None) -> List[Dict]:
+        """Retrieve projects from XTM, paging through ALL results (no 1000 cap).
+
+        modified_from (ISO 'YYYY-MM-DD'): only fetch projects modified on/after
+        this date. Safe for reporting because any project with work completed in
+        a period was necessarily modified at/after that completion, so its
+        modificationDate >= period start — filtering by the period start never
+        drops in-period work, but skips the many archived projects untouched
+        since then (big speedup). Leave None to fetch everything (e.g. snapshots)."""
         try:
-            # Get projects - adjust endpoint based on actual XTM API
             params = {}
             if status:
                 params['status'] = status
-
-            projects = self._make_request('projects', params=params)
-            logger.info(f"Retrieved {len(projects) if isinstance(projects, list) else 'unknown'} projects")
-            return projects if isinstance(projects, list) else []
+            if modified_from:
+                params['modifiedDateFrom'] = modified_from
+            projects = self._fetch_all_pages('projects', params=params)
+            logger.info(f"Retrieved {len(projects)} projects"
+                        + (f" modified since {modified_from}" if modified_from else ""))
+            return projects
         except Exception as e:
             logger.error(f"Failed to get projects: {e}")
             return []
@@ -561,8 +593,10 @@ class XTMReportGenerator:
             'projects': []
         }
 
-        # Get all projects
-        projects = self.get_projects()
+        # Only fetch projects modified since the period start — in-period work
+        # always bumps modificationDate, so this can't drop real work but skips
+        # archived projects untouched since then.
+        projects = self.get_projects(modified_from=start_date.strftime('%Y-%m-%d'))
 
         # Fetch statistics and status for all projects in parallel
         from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -918,8 +952,8 @@ class XTMReportGenerator:
             'projects': []
         }
 
-        # Get all projects
-        projects = self.get_projects()
+        # Only fetch projects modified since the week start (see aggregate_monthly_data).
+        projects = self.get_projects(modified_from=start_date.strftime('%Y-%m-%d'))
 
         # Fetch statistics and status for all projects in parallel
         from concurrent.futures import ThreadPoolExecutor, as_completed
