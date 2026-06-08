@@ -23,6 +23,9 @@ python3 generate_report.py --weekly
 # Weekly report - automatically send email via Outlook
 python3 generate_report.py --weekly --auto-send
 
+# Snapshot per-user stats for all active projects (preserves names after archival)
+python3 generate_report.py --snapshot
+
 # Debug: View user statistics (shows all users including excluded ones)
 python3 debug_user_stats.py
 
@@ -44,6 +47,9 @@ python3 test_single_project.py
 
 # Set up weekly automated sending (every Monday at 9:00 AM)
 ./setup_weekly_schedule.sh
+
+# Set up daily snapshot (every day at 6:00 PM) so archived projects keep real user names
+./setup_snapshot_schedule.sh
 
 # Test the monthly automation configuration
 ./test_automation.sh
@@ -83,7 +89,11 @@ The automation includes multiple layers of error handling to ensure it never fai
 
 **Per-User Statistics API**: Uses `/projects/{id}/statistics` endpoint (not `/metrics`) to retrieve word counts broken down by user and workflow step. This enables filtering out specific users' work.
 
-**Excluded Users**: By default, work from `leo.chang@familysearch.org`, `LeoAdmin`, `Robert.Sena@churchofjesuschrist.org`, `MartinADMIN`, and `Tester BSP BSP` is excluded from all reports. This is handled in `get_project_statistics()` by filtering the `usersStatistics` array before aggregation.
+**Archived-Project Snapshots**: When a project is archived, `/projects/{id}/statistics` stops returning the per-user breakdown, so reports can only fall back to `/metrics` (no user attribution) and bucket that work under a generic "Archived User". To prevent this, `snapshot_active_projects()` (run via `--snapshot`, scheduled daily by `com.xtm.snapshot.plist`) caches each active project's raw `/statistics` + `/status` to `.cache/snapshots/project_{id}.json`. During aggregation, if a project's live statistics are empty, `_restore_stats_from_snapshot()` restores the per-user data from the snapshot (re-applying the current excluded-user filter) before the metrics fallback runs — so real names are preserved. Snapshots are only written when statistics are non-empty, so an already-archived project never overwrites a good snapshot. This only helps projects snapshotted while still active; projects archived before any snapshot existed still use the "Archived User" fallback.
+
+**Excluded Users**: By default, work from `leo.chang@familysearch.org`, `LeoAdmin`, `Robert.Sena@churchofjesuschrist.org`, `MartinADMIN`, and `Tester BSP BSP` is excluded from all reports. This is handled in `get_project_statistics()` by filtering the `usersStatistics` array before aggregation. (The live default list lives in the `EXCLUDED_USERS` class constant.)
+
+**Full Volunteer Roster**: The user report lists *every* volunteer in XTM — defined as everyone returned by `GET /users` minus `EXCLUDED_USERS` — not just whoever logged work in the period. `get_volunteers()` fetches the roster plus each user's assigned target languages from `/users/{id}/language-combinations` (parallel; memoized in-process and cached to `.cache/volunteers.json` for 24h). After aggregation, `_inject_zero_volunteers()` adds a zero row per assigned language for any volunteer with no work this period (matched by `username`; volunteers who did work are untouched). Injection runs *after* the month cache is saved and YTD is built, so caches keep only real work. Charts stay limited to volunteers/languages with actual data — zero rows appear in tables and filters only.
 
 **Locale Translation**: All locale codes (e.g., `es_ES`, `zh_TW`) are converted to readable language names (e.g., "Spanish", "Chinese (Traditional)") using the `LOCALE_TO_LANGUAGE` dictionary (66 mappings). This happens during data aggregation via `_locale_to_language_name()`.
 
@@ -183,6 +193,8 @@ The automation includes multiple layers of error handling to ensure it never fai
 **com.xtm.monthlyreport.plist**: LaunchAgent configuration for monthly scheduling (1st of month at 9:00 AM).
 
 **com.xtm.weeklyreport.plist**: LaunchAgent configuration for weekly scheduling (every Monday at 9:00 AM).
+
+**com.xtm.snapshot.plist**: LaunchAgent configuration for the daily per-user statistics snapshot (every day at 6:00 PM). Logs to `xtm_snapshot.log` / `xtm_snapshot_error.log`.
 
 **xtm-docs.json**: Complete XTM REST API OpenAPI 3.0 specification (688KB).
 

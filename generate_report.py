@@ -95,6 +95,7 @@ class XTMReportGenerator:
     # Locale code to language name mapping
     LOCALE_TO_LANGUAGE = {
         'en_US': 'English (USA)',
+        'ar_AA': 'Arabic',
         'ar_AE': 'Arabic (UAE)',
         'ar_EG': 'Arabic (Egypt)',
         'ar_SA': 'Arabic (Saudi Arabia)',
@@ -136,6 +137,7 @@ class XTMReportGenerator:
         'ms_MY': 'Malay',
         'nl_NL': 'Dutch',
         'no_NO': 'Norwegian',
+        'nb_NO': 'Norwegian',
         'pl_PL': 'Polish',
         'pt_BR': 'Portuguese (Brazil)',
         'pt_PT': 'Portuguese (Portugal)',
@@ -161,6 +163,7 @@ class XTMReportGenerator:
         'uk_UA': 'Ukrainian',
         'ur_IN': 'Urdu',
         'vi_VN': 'Vietnamese',
+        'goyu': 'Chinese',
         'zh_CN': 'Chinese (Simplified)',
         'zh_HK': 'Chinese (Hong Kong)',
         'zh_TW': 'Chinese (Traditional)',
@@ -196,6 +199,7 @@ class XTMReportGenerator:
             'Content-Type': 'application/json'
         }
         self.report_date = datetime.now()
+        self._volunteers_cache = None  # memoized roster (see get_volunteers)
 
         if self.weekly:
             # Calculate previous 7 days for weekly report
@@ -502,31 +506,140 @@ class XTMReportGenerator:
 
         return username
 
-    def get_project_statistics(self, project_id: int):
-        """Get detailed per-user statistics for a project, excluding specified users."""
+    def _filter_excluded_from_stats(self, stats: List[Dict]) -> List[Dict]:
+        """Remove excluded users from a raw /statistics list (drops languages left empty)."""
+        if not isinstance(stats, list):
+            return []
+
+        filtered_stats = []
+        for lang_stats in stats:
+            users_statistics = lang_stats.get('usersStatistics', [])
+            filtered_users = [
+                user for user in users_statistics
+                if not self._is_excluded_user(user)
+            ]
+
+            if filtered_users:
+                lang_stats_copy = lang_stats.copy()
+                lang_stats_copy['usersStatistics'] = filtered_users
+                filtered_stats.append(lang_stats_copy)
+
+        return filtered_stats
+
+    def get_volunteers(self, force_refresh: bool = False) -> Dict[str, Dict]:
+        """Return the authoritative volunteer roster from XTM: every user in
+        /users that is NOT in EXCLUDED_USERS, keyed by lowercased username.
+
+        Each entry is {'user': display name, 'username': login, 'languages':
+        [target language names]} where languages come from the user's assigned
+        /users/{id}/language-combinations. Used to list every volunteer in the
+        user report — including those with no work this period (shown as zeros).
+
+        The roster is memoized in-process and cached to .cache/volunteers.json
+        for 24h so repeated runs don't re-issue one API call per user."""
+        import time
+        import re
+        from concurrent.futures import ThreadPoolExecutor
+
+        if self._volunteers_cache is not None:
+            return self._volunteers_cache
+
+        cache_path = Path(__file__).parent / ".cache" / "volunteers.json"
+        cache_path.parent.mkdir(exist_ok=True)
+        if not force_refresh and cache_path.exists():
+            try:
+                if (time.time() - cache_path.stat().st_mtime) < 24 * 3600:
+                    with open(cache_path) as f:
+                        self._volunteers_cache = json.load(f)
+                    logger.info(f"Loaded {len(self._volunteers_cache)} volunteers from cache")
+                    return self._volunteers_cache
+            except Exception as e:
+                logger.warning(f"Failed to read volunteer cache: {e}")
+
+        try:
+            users = self._fetch_all_pages('users')
+        except Exception as e:
+            logger.warning(f"Failed to fetch volunteer roster: {e}")
+            return {}
+
+        excluded_lower = {u.lower() for u in self.EXCLUDED_USERS}
+        roster = [u for u in users
+                  if u.get('id') and u.get('username', '').lower() not in excluded_lower]
+        logger.info(f"Fetching language combinations for {len(roster)} volunteers...")
+
+        def fetch_langs(u):
+            try:
+                resp = self._make_request(f"users/{u['id']}/language-combinations") or {}
+                combos = resp.get('languageCombinations', [])
+            except Exception:
+                combos = []
+            langs = sorted({self._locale_to_language_name(c.get('targetLanguage'))
+                            for c in combos if c.get('targetLanguage')})
+            return u, langs
+
+        volunteers = {}
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            for u, langs in executor.map(fetch_langs, roster):
+                uname = u.get('username', '')
+                # Drop XTM's "generic" token from names (mirrors _resolve_user_name).
+                name = re.sub(r'\bgeneric\b', '', f"{u.get('firstName', '')} {u.get('lastName', '')}", flags=re.I)
+                name = ' '.join(name.split()) or uname
+                volunteers[uname.lower()] = {
+                    'user': name,
+                    'username': uname,
+                    'languages': langs,
+                }
+
+        try:
+            with open(cache_path, 'w') as f:
+                json.dump(volunteers, f)
+        except Exception as e:
+            logger.warning(f"Failed to write volunteer cache: {e}")
+
+        self._volunteers_cache = volunteers
+        logger.info(f"Volunteer roster ready: {len(volunteers)} volunteers")
+        return volunteers
+
+    def _inject_zero_volunteers(self, user_dict: Dict, value_field: str):
+        """Add zero-activity rows to a user statistics dict for every volunteer
+        in the roster who did no work in the period. One row per assigned target
+        language (from the roster); volunteers with no assigned languages get a
+        single language-less row. Volunteers who did any work are left untouched
+        (matched by username), so their real per-language rows are unaffected.
+
+        `value_field` is the per-user data bucket to initialize empty:
+        'workflow_steps' for current-period tables, 'months' for YTD."""
+        roster = self.get_volunteers()
+        if not roster:
+            return
+        present = {(ud.get('username') or '').lower()
+                   for ud in user_dict.values() if ud.get('username')}
+        for uname, info in roster.items():
+            if uname in present:
+                continue
+            for lang in (info['languages'] or ['']):
+                key = f"{info['user']}|{lang}"
+                if key in user_dict:
+                    continue
+                user_dict[key] = {
+                    'user': info['user'],
+                    'username': info['username'],
+                    'language': lang,
+                    value_field: {},
+                }
+
+    def get_project_statistics_raw(self, project_id: int) -> List[Dict]:
+        """Get raw per-user statistics for a project (no exclusion filtering applied)."""
         try:
             stats = self._make_request(f'projects/{project_id}/statistics')
-            if not isinstance(stats, list):
-                return []
-
-            # Filter out excluded users' work
-            filtered_stats = []
-            for lang_stats in stats:
-                users_statistics = lang_stats.get('usersStatistics', [])
-                filtered_users = [
-                    user for user in users_statistics
-                    if not self._is_excluded_user(user)
-                ]
-
-                if filtered_users:
-                    lang_stats_copy = lang_stats.copy()
-                    lang_stats_copy['usersStatistics'] = filtered_users
-                    filtered_stats.append(lang_stats_copy)
-
-            return filtered_stats
+            return stats if isinstance(stats, list) else []
         except Exception as e:
             logger.warning(f"Failed to get statistics for project {project_id}: {e}")
             return []
+
+    def get_project_statistics(self, project_id: int):
+        """Get detailed per-user statistics for a project, excluding specified users."""
+        return self._filter_excluded_from_stats(self.get_project_statistics_raw(project_id))
 
     def get_workflow_steps(self, project_id: int) -> List[Dict]:
         """Get workflow steps for a project."""
@@ -625,6 +738,19 @@ class XTMReportGenerator:
             project = project_map[project_id]
             stats_list, project_status = project_results[project_id]
 
+            # If the live statistics are empty (project archived), restore the
+            # per-user breakdown from a snapshot taken while it was still active.
+            # This preserves real user names instead of falling back to the
+            # metrics-only "Archived User" path below.
+            if not stats_list:
+                snap_stats, snap_status = self._restore_stats_from_snapshot(project_id)
+                if snap_stats:
+                    stats_list = snap_stats
+                    if not project_status:
+                        project_status = snap_status
+                    logger.info(f"Project {project_id} archived; restored per-user "
+                                f"statistics from snapshot")
+
             # Build a map of completion dates from /status: {jobId: {stepName: finishDate}}
             # These finishDate values are preserved even when work is reopened
             # Use lowercase step names as keys to handle case mismatches between endpoints
@@ -700,8 +826,10 @@ class XTMReportGenerator:
                                     if target_lang_name not in target_languages:
                                         target_languages.append(target_lang_name)
 
-                                    # Use generic "Archived User" for attribution
-                                    username = "Archived User"
+                                    # Use generic "Archived User" for attribution,
+                                    # qualified by language so each archived language
+                                    # is distinguishable in the report
+                                    username = f"Archived User ({target_lang_name})"
 
                                     # Track user statistics
                                     user_key = f"{username}|{target_lang_name}"
@@ -829,6 +957,7 @@ class XTMReportGenerator:
                                         if user_key not in data['user_statistics']:
                                             data['user_statistics'][user_key] = {
                                                 'user': username,
+                                                'username': user_stat.get('username', ''),
                                                 'language': target_lang_name,
                                                 'workflow_steps': {}
                                             }
@@ -910,6 +1039,7 @@ class XTMReportGenerator:
             for uk, ud in month_data.get('user_statistics', {}).items():
                 cache['users'][uk] = {
                     'user': ud['user'],
+                    'username': ud.get('username', ''),
                     'language': ud['language'],
                     'total': sum(ud['workflow_steps'].values())
                 }
@@ -931,6 +1061,141 @@ class XTMReportGenerator:
         except Exception as e:
             logger.warning(f"Failed to load cache for {month}: {e}")
             return None
+
+    def _get_ytd_language_set(self) -> set:
+        """Return the set of language names that had work at any point this year,
+        read from the monthly JSON caches (January through the current month).
+
+        Used to keep a consistent language list across reports: a language that
+        appeared earlier in the year still shows (as a zero row) even when it had
+        no work in the current period. Weekly reports don't compute YTD data, so
+        they rely on this cache-based set."""
+        langs = set()
+        year = self.report_date.year
+        for m in range(1, self.report_date.month + 1):
+            cached = self._load_month_cache(f"{year}-{m:02d}")
+            if cached:
+                langs.update(cached.get('languages', {}).keys())
+        return langs
+
+    def _report_language_set(self, ytd_monthly_breakdown: Dict) -> set:
+        """Full set of languages the language table should list, including ones
+        with no work this period (shown as zeros). This is the union of:
+          - languages seen this year (YTD breakdown for monthly reports; the
+            monthly caches for weekly reports), and
+          - every target language any roster volunteer is assigned to.
+        The roster part keeps the language report in sync with the user report,
+        which lists volunteers under their assigned languages even when idle."""
+        if self.weekly:
+            langs = self._get_ytd_language_set()
+        else:
+            langs = set(ytd_monthly_breakdown.get('languages', {}).keys())
+        for info in self.get_volunteers().values():
+            langs.update(info.get('languages', []))
+        return langs
+
+    # ------------------------------------------------------------------
+    # Per-project statistics snapshots
+    #
+    # When a project is archived, the XTM /projects/{id}/statistics endpoint
+    # stops returning the per-user breakdown, so the report can only fall back
+    # to /metrics (no user attribution) and buckets that work under the generic
+    # "Archived User". To avoid that, snapshot_active_projects() periodically
+    # caches each active project's raw /statistics (+ /status step finish dates)
+    # to .cache/snapshots/. When aggregation later finds a project's live
+    # statistics empty, it restores real per-user data from the snapshot.
+    # ------------------------------------------------------------------
+    def _get_snapshot_dir(self) -> Path:
+        """Directory holding per-project raw statistics snapshots."""
+        snap_dir = Path(__file__).parent / ".cache" / "snapshots"
+        snap_dir.mkdir(parents=True, exist_ok=True)
+        return snap_dir
+
+    def _get_snapshot_path(self, project_id: int) -> Path:
+        return self._get_snapshot_dir() / f"project_{project_id}.json"
+
+    def _save_project_snapshot(self, project_id, name, status, statistics, status_steps) -> bool:
+        """Persist a project's raw /statistics and /status so per-user detail
+        survives archival. Only writes when statistics are non-empty, so an
+        already-archived project's empty response never overwrites a good snapshot."""
+        if not statistics:
+            return False
+        try:
+            payload = {
+                'project_id': project_id,
+                'name': name,
+                'status': status,
+                'snapshot_date': datetime.now().isoformat(),
+                'statistics': statistics,
+                'status_steps': status_steps or {},
+            }
+            with open(self._get_snapshot_path(project_id), 'w') as f:
+                json.dump(payload, f)
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to snapshot project {project_id}: {e}")
+            return False
+
+    def _load_project_snapshot(self, project_id: int) -> Dict:
+        """Load a project's statistics snapshot. Returns None if not available."""
+        path = self._get_snapshot_path(project_id)
+        if not path.exists():
+            return None
+        try:
+            with open(path) as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"Failed to load snapshot for project {project_id}: {e}")
+            return None
+
+    def _restore_stats_from_snapshot(self, project_id: int):
+        """Return (filtered_statistics, status_steps) from a project's snapshot,
+        re-applying the current excluded-user filter. Returns ([], {}) if no
+        usable snapshot exists."""
+        snap = self._load_project_snapshot(project_id)
+        if not snap:
+            return [], {}
+        filtered = self._filter_excluded_from_stats(snap.get('statistics', []))
+        if not filtered:
+            return [], {}
+        return filtered, snap.get('status_steps') or {}
+
+    def snapshot_active_projects(self) -> int:
+        """Fetch and cache raw per-user statistics for every project that still
+        exposes them (i.e. not yet archived). Run this regularly (e.g. daily) so
+        that when a project is later archived the report can restore real user
+        names from the snapshot instead of bucketing work under 'Archived User'.
+        Returns the number of projects snapshotted."""
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        projects = self.get_projects()
+        project_map = {p.get('id'): p for p in projects if p.get('id')}
+        project_ids = list(project_map.keys())
+        logger.info(f"Snapshotting per-user statistics for {len(project_ids)} projects...")
+
+        def fetch(pid):
+            try:
+                return (pid,
+                        self.get_project_statistics_raw(pid),
+                        self.get_project_status_with_steps(pid))
+            except Exception as e:
+                logger.warning(f"Snapshot fetch failed for project {pid}: {e}")
+                return pid, [], {}
+
+        saved = 0
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(fetch, pid): pid for pid in project_ids}
+            for future in as_completed(futures):
+                pid, stats, status_steps = future.result()
+                project = project_map.get(pid, {})
+                if self._save_project_snapshot(pid, project.get('name', 'Unknown'),
+                                               project.get('status', 'UNKNOWN'),
+                                               stats, status_steps):
+                    saved += 1
+
+        logger.info(f"Snapshot complete: saved {saved} of {len(project_ids)} projects "
+                    f"to {self._get_snapshot_dir()}")
+        return saved
 
     def aggregate_weekly_data(self, start_date: datetime, end_date: datetime) -> Dict:
         """
@@ -982,6 +1247,17 @@ class XTMReportGenerator:
         for project_id in project_ids:
             project = project_map[project_id]
             stats_list, project_status = project_results[project_id]
+
+            # Restore per-user data from a snapshot if the project is archived
+            # (see aggregate_monthly_data for the rationale).
+            if not stats_list:
+                snap_stats, snap_status = self._restore_stats_from_snapshot(project_id)
+                if snap_stats:
+                    stats_list = snap_stats
+                    if not project_status:
+                        project_status = snap_status
+                    logger.info(f"Project {project_id} archived; restored per-user "
+                                f"statistics from snapshot")
 
             job_step_dates = {}
             if project_status:
@@ -1045,7 +1321,8 @@ class XTMReportGenerator:
                                     if target_lang_name not in target_languages:
                                         target_languages.append(target_lang_name)
 
-                                    username = "Archived User"
+                                    # Qualify the generic archived label by language
+                                    username = f"Archived User ({target_lang_name})"
 
                                     user_key = f"{username}|{target_lang_name}"
                                     if user_key not in data['user_statistics']:
@@ -1152,6 +1429,7 @@ class XTMReportGenerator:
                                         if user_key not in data['user_statistics']:
                                             data['user_statistics'][user_key] = {
                                                 'user': username,
+                                                'username': user_stat.get('username', ''),
                                                 'language': target_lang_name,
                                                 'workflow_steps': {}
                                             }
@@ -1225,7 +1503,7 @@ class XTMReportGenerator:
 
                 for uk, ud in current_month_data['user_statistics'].items():
                     if uk not in users:
-                        users[uk] = {'user': ud['user'], 'language': ud['language'], 'months': {}}
+                        users[uk] = {'user': ud['user'], 'username': ud.get('username', ''), 'language': ud['language'], 'months': {}}
                     users[uk]['months'][month] = sum(ud['workflow_steps'].values())
                 continue
 
@@ -1240,7 +1518,7 @@ class XTMReportGenerator:
 
                 for uk, ud in cached['users'].items():
                     if uk not in users:
-                        users[uk] = {'user': ud['user'], 'language': ud['language'], 'months': {}}
+                        users[uk] = {'user': ud['user'], 'username': ud.get('username', ''), 'language': ud['language'], 'months': {}}
                     users[uk]['months'][month] = ud['total']
                 continue
 
@@ -1259,7 +1537,7 @@ class XTMReportGenerator:
 
                 for uk, ud in month_data['user_statistics'].items():
                     if uk not in users:
-                        users[uk] = {'user': ud['user'], 'language': ud['language'], 'months': {}}
+                        users[uk] = {'user': ud['user'], 'username': ud.get('username', ''), 'language': ud['language'], 'months': {}}
                     users[uk]['months'][month] = sum(ud['workflow_steps'].values())
 
                 # Save to cache for future runs
@@ -1358,7 +1636,7 @@ class XTMReportGenerator:
         wb.remove(wb.active)  # Remove default sheet
 
         # === CURRENT PERIOD SHEET ===
-        self._create_monthly_sheet(wb, monthly_data)
+        self._create_monthly_sheet(wb, monthly_data, ytd_monthly_breakdown)
 
         # === YTD SHEET (only for monthly reports) ===
         if not self.weekly:
@@ -1374,7 +1652,7 @@ class XTMReportGenerator:
         logger.info(f"Excel report saved to {output_path}")
         return output_path
 
-    def _create_monthly_sheet(self, wb: 'Workbook', monthly_data: Dict):
+    def _create_monthly_sheet(self, wb: 'Workbook', monthly_data: Dict, ytd_monthly_breakdown: Dict = None):
         """Create the current period data sheet with workflow breakdown."""
         from openpyxl.styles import Font, PatternFill, Alignment
         from openpyxl.chart import BarChart, Reference
@@ -1395,6 +1673,11 @@ class XTMReportGenerator:
             if language not in monthly_languages:
                 monthly_languages[language] = {}
             monthly_languages[language][workflow_step] = words
+
+        # Keep every language seen this year, even with no work this period
+        # (shows as a zero row), matching the HTML report.
+        for lang in self._report_language_set(ytd_monthly_breakdown or {}):
+            monthly_languages.setdefault(lang, {})
 
         # Get all workflow steps
         all_steps = set()
@@ -1443,16 +1726,19 @@ class XTMReportGenerator:
         # Enable AutoFilter
         ws.auto_filter.ref = ws.dimensions
 
-        # Add bar chart
-        if len(sorted_languages) > 0:
+        # Add bar chart — only languages with work this period. They're sorted
+        # to the top, so capping the row range excludes the zero-filled ones
+        # (which remain in the table) without cluttering the chart.
+        chart_lang_count = sum(1 for lang in sorted_languages if monthly_language_totals[lang] > 0)
+        if chart_lang_count > 0:
             chart = BarChart()
             chart.title = "Words Processed by Language"
             chart.y_axis.title = "Words"
             chart.x_axis.title = "Language"
 
             # Total column data
-            data = Reference(ws, min_col=len(headers), min_row=1, max_row=len(sorted_languages) + 1)
-            cats = Reference(ws, min_col=1, min_row=2, max_row=len(sorted_languages) + 1)
+            data = Reference(ws, min_col=len(headers), min_row=1, max_row=chart_lang_count + 1)
+            cats = Reference(ws, min_col=1, min_row=2, max_row=chart_lang_count + 1)
 
             chart.add_data(data, titles_from_data=True)
             chart.set_categories(cats)
@@ -1511,15 +1797,17 @@ class XTMReportGenerator:
         # Enable AutoFilter
         ws.auto_filter.ref = ws.dimensions
 
-        # Add line chart for top 10 languages
-        if len(sorted_languages) > 0:
+        # Add line chart for top 10 languages — only languages with work this year.
+        # They're sorted to the top, so capping the range excludes zero rows.
+        nonzero_langs = sum(1 for _, md in sorted_languages if sum(md.values()) > 0)
+        if nonzero_langs > 0:
             chart = LineChart()
             chart.title = "Language Translation Trends (Top 10)"
             chart.y_axis.title = "Words"
             chart.x_axis.title = "Month"
 
             # Add data for top 10 languages
-            num_langs = min(10, len(sorted_languages))
+            num_langs = min(10, nonzero_langs)
             for row_idx in range(2, num_langs + 2):
                 data = Reference(ws, min_col=2, max_col=len(months) + 1, min_row=row_idx, max_row=row_idx)
                 chart.add_data(data, titles_from_data=False)
@@ -1609,15 +1897,17 @@ class XTMReportGenerator:
         # Enable AutoFilter
         ws.auto_filter.ref = ws.dimensions
 
-        # Add bar chart for top 20 users
-        if len(sorted_users) > 0:
+        # Add bar chart for top 20 users — only volunteers with work this period.
+        # They're sorted to the top, so capping the range excludes zero rows.
+        nonzero_users = sum(1 for _, ud in sorted_users if sum(ud['workflow_steps'].values()) > 0)
+        if nonzero_users > 0:
             chart = BarChart()
             chart.title = "Words Processed by User (Top 20)"
             chart.y_axis.title = "Words"
             chart.x_axis.title = "User"
 
             # Total column data (limit to top 20)
-            num_users = min(20, len(sorted_users))
+            num_users = min(20, nonzero_users)
             data = Reference(ws, min_col=len(headers), min_row=1, max_row=num_users + 1)
             cats = Reference(ws, min_col=1, min_row=2, max_row=num_users + 1)
 
@@ -1686,15 +1976,17 @@ class XTMReportGenerator:
         # Enable AutoFilter
         ws.auto_filter.ref = ws.dimensions
 
-        # Add line chart for top 10 users
-        if len(sorted_users) > 0:
+        # Add line chart for top 10 users — only volunteers with work this year.
+        # They're sorted to the top, so capping the range excludes zero rows.
+        nonzero_users = sum(1 for _, ud in sorted_users if sum(ud['months'].values()) > 0)
+        if nonzero_users > 0:
             chart = LineChart()
             chart.title = "User Productivity Trends (Top 10)"
             chart.y_axis.title = "Words"
             chart.x_axis.title = "Month"
 
             # Add data for top 10 users
-            num_users = min(10, len(sorted_users))
+            num_users = min(10, nonzero_users)
             for row_idx in range(2, num_users + 2):
                 data = Reference(ws, min_col=3, max_col=len(months) + 2, min_row=row_idx, max_row=row_idx)
                 chart.add_data(data, titles_from_data=False)
@@ -1736,6 +2028,12 @@ class XTMReportGenerator:
                 monthly_languages[language] = {}
             monthly_languages[language][workflow_step] = words
 
+        # Keep every language seen this year in the current-period table/chart,
+        # even when it had no work this period — it shows as a zero row / bar
+        # rather than disappearing.
+        for lang in self._report_language_set(ytd_monthly_breakdown):
+            monthly_languages.setdefault(lang, {})
+
         # Calculate totals per language for monthly
         monthly_language_totals = {lang: sum(steps.values()) for lang, steps in monthly_languages.items()}
 
@@ -1745,8 +2043,11 @@ class XTMReportGenerator:
             all_steps.update(lang_steps.keys())
         workflow_steps = sorted(all_steps, key=lambda x: ['translate', 'correct', 'final review'].index(x) if x in ['translate', 'correct', 'final review'] else 999)
 
-        # Prepare monthly bar chart data (stacked by workflow step)
-        monthly_lang_labels = sorted(monthly_language_totals.keys(), key=lambda x: monthly_language_totals[x], reverse=True)
+        # Prepare monthly bar chart data (stacked by workflow step).
+        # Charts show only languages with work this period; the zero-filled
+        # languages stay in the table/filters but would just clutter the chart.
+        monthly_lang_labels = [lang for lang in sorted(monthly_language_totals.keys(), key=lambda x: monthly_language_totals[x], reverse=True)
+                               if monthly_language_totals[lang] > 0]
         monthly_workflow_datasets = []
         colors = ['#FF6384', '#36A2EB', '#FFCE56', '#4BC0C0', '#9966FF']
         for idx, step in enumerate(workflow_steps):
@@ -1757,12 +2058,16 @@ class XTMReportGenerator:
                 'backgroundColor': colors[idx % len(colors)]
             })
 
-        # Monthly user data for chart
+        # Monthly user data for chart — only volunteers with work this period;
+        # zero-work volunteers stay in the table/filters but would clutter the chart.
         monthly_user_labels = []
         monthly_user_data_points = []
         for user_key, user_data in sorted(user_statistics.items(), key=lambda x: sum(x[1]['workflow_steps'].values()), reverse=True):
+            total = sum(user_data['workflow_steps'].values())
+            if total <= 0:
+                continue
             monthly_user_labels.append(f"{user_data['user']} ({user_data['language']})")
-            monthly_user_data_points.append(sum(user_data['workflow_steps'].values()))
+            monthly_user_data_points.append(total)
 
         # Create monthly language table HTML
         monthly_lang_table_html = ""
@@ -1806,7 +2111,9 @@ class XTMReportGenerator:
                 '#FF9F40', '#FF6384', '#C9CBCF', '#4BC0C0', '#FF9F40'
             ]
 
-            sorted_ytd_languages = sorted(ytd_languages.items(), key=lambda x: sum(x[1].values()), reverse=True)
+            # Charts only: drop languages with no work this year (they remain in the table).
+            sorted_ytd_languages = [item for item in sorted(ytd_languages.items(), key=lambda x: sum(x[1].values()), reverse=True)
+                                    if sum(item[1].values()) > 0]
 
             for idx, (language, month_data) in enumerate(sorted_ytd_languages):
                 data_points = [month_data.get(month, 0) for month in months]
@@ -1820,7 +2127,9 @@ class XTMReportGenerator:
 
             # YTD user data
             ytd_user_datasets = []
-            sorted_ytd_users = sorted(ytd_users.items(), key=lambda x: sum(x[1]['months'].values()), reverse=True)
+            # Charts only: drop zero-work volunteers (they remain in the table below).
+            sorted_ytd_users = [item for item in sorted(ytd_users.items(), key=lambda x: sum(x[1]['months'].values()), reverse=True)
+                                if sum(item[1]['months'].values()) > 0]
 
             for idx, (user_key, user_data) in enumerate(sorted_ytd_users):
                 username = user_data['user']
@@ -2879,6 +3188,22 @@ Best regards
                     logger.error(f"Failed to aggregate YTD data: {e}", exc_info=True)
                     ytd_monthly_breakdown = {'months': [], 'languages': {}, 'users': {}}
 
+            # Add every volunteer in the XTM roster (minus excluded users) to the
+            # user report, including those with no work this period (zero rows,
+            # one per assigned language). Done after caching/YTD so the month
+            # caches keep only real work. Charts stay limited to non-zero users.
+            try:
+                self._inject_zero_volunteers(monthly_data.get('user_statistics', {}), 'workflow_steps')
+                if not self.weekly:
+                    self._inject_zero_volunteers(ytd_monthly_breakdown.get('users', {}), 'months')
+                    # Keep the YTD language table in sync with the user report:
+                    # include every language volunteers represent, even idle ones.
+                    ytd_langs = ytd_monthly_breakdown.setdefault('languages', {})
+                    for lang in self._report_language_set(ytd_monthly_breakdown):
+                        ytd_langs.setdefault(lang, {})
+            except Exception as e:
+                logger.warning(f"Failed to add full volunteer roster to user report: {e}")
+
             if not (monthly_data.get('workflow_by_language') or ytd_monthly_breakdown.get('languages')):
                 logger.warning("No data available for reporting period")
 
@@ -2982,10 +3307,17 @@ def main():
                        help='Automatically send email (default: create draft only)')
     parser.add_argument('--weekly', action='store_true',
                        help='Generate weekly report for previous 7 days (default: monthly report)')
+    parser.add_argument('--snapshot', action='store_true',
+                       help='Snapshot per-user statistics for all active projects (no report). '
+                            'Run regularly so archived projects keep real user names.')
     args = parser.parse_args()
 
     try:
         generator = XTMReportGenerator(auto_send=args.auto_send, weekly=args.weekly)
+        if args.snapshot:
+            count = generator.snapshot_active_projects()
+            print(f"✓ Snapshotted per-user statistics for {count} active project{'s' if count != 1 else ''}")
+            return
         generator.generate_report()
     except Exception as e:
         logger.error(f"Fatal error: {e}")
