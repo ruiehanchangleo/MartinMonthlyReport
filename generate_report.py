@@ -200,6 +200,9 @@ class XTMReportGenerator:
         }
         self.report_date = datetime.now()
         self._volunteers_cache = None  # memoized roster (see get_volunteers)
+        self._volunteer_hours = None   # per-volunteer active hours, current period (see _compute_volunteer_hours)
+        self._volunteer_hours_ytd = None  # per-volunteer active hours, year-to-date totals (monthly reports only)
+        self._volunteer_hours_ytd_breakdown = None  # YTD active hours per volunteer per month (for the trend chart)
 
         if self.weekly:
             # Calculate previous 7 days for weekly report
@@ -1647,6 +1650,9 @@ class XTMReportGenerator:
         if not self.weekly:
             self._create_user_ytd_sheet(wb, ytd_monthly_breakdown)
 
+        # === VOLUNTEER HOURS SHEET (from XTM login/logout history) ===
+        self._create_volunteer_hours_sheet(wb)
+
         # Save workbook
         wb.save(output_path)
         logger.info(f"Excel report saved to {output_path}")
@@ -2465,7 +2471,11 @@ class XTMReportGenerator:
             </div>
         </div>
 
+        {self._volunteer_hours_html()}
+
         {ytd_section_html}
+
+        {self._volunteer_hours_html_ytd()}
     </div>
 
     <script>
@@ -2671,8 +2681,8 @@ class XTMReportGenerator:
                 const aCell = a.cells[columnIndex];
                 const bCell = b.cells[columnIndex];
 
-                let aVal = aCell.textContent.trim();
-                let bVal = bCell.textContent.trim();
+                let aVal = (aCell.dataset.sort !== undefined ? aCell.dataset.sort : aCell.textContent).trim();
+                let bVal = (bCell.dataset.sort !== undefined ? bCell.dataset.sort : bCell.textContent).trim();
 
                 aVal = aVal.replace(/,/g, '');
                 bVal = bVal.replace(/,/g, '');
@@ -3135,6 +3145,385 @@ Best regards
             logger.warning(f"Failed to create Apple Mail email: {e}")
             return False
 
+    def _compute_volunteer_hours(self):
+        """Fetch + aggregate volunteer active hours for the reporting period.
+
+        Uses the GUI login/logout history (Playwright helper). Best-effort:
+        stores an 'unavailable' summary on any failure so the report still
+        generates. Respects EXCLUDED_USERS.
+        """
+        try:
+            import volunteer_hours as vh
+        except Exception as e:
+            logger.warning("volunteer_hours module unavailable: %s", e)
+            self._volunteer_hours = {"by_user": {}, "unavailable": True,
+                                     "total_hours": 0.0, "total_sessions": 0,
+                                     "volunteer_count": 0}
+            return
+
+        if self.weekly:
+            # Weekly reports have no YTD; fetch just the week.
+            period_start = self.report_start_date.date()
+            period_end = self.report_end_date.date()
+            logger.info("Fetching volunteer login-history hours for %s..%s",
+                        period_start, period_end)
+            self._volunteer_hours = vh.get_volunteer_hours(
+                period_start, period_end, self.EXCLUDED_USERS, refresh=True)
+            self._volunteer_hours_ytd = None
+        else:
+            year, month = (int(x) for x in self.report_month.split('-'))
+            month_start = datetime(year, month, 1).date()
+            # last day of the report month = day before the first of next month
+            next_month = datetime(year + (month == 12), (month % 12) + 1, 1).date()
+            month_end = next_month - timedelta(days=1)
+            ytd_start = datetime(year, 1, 1).date()
+            ytd_end = month_end
+
+            # Fetch the whole YTD range once; derive the current month from the
+            # same fetched data (no second browser login/fetch).
+            logger.info("Fetching volunteer login-history hours (YTD) for %s..%s",
+                        ytd_start, ytd_end)
+            self._volunteer_hours_ytd = vh.get_volunteer_hours(
+                ytd_start, ytd_end, self.EXCLUDED_USERS, refresh=True)
+            src = self._volunteer_hours_ytd.get("source_file")
+            if src and not self._volunteer_hours_ytd.get("unavailable"):
+                self._volunteer_hours = vh.aggregate_from_file(
+                    src, month_start, month_end, self.EXCLUDED_USERS)
+                # Per-month breakdown for the YTD trend chart (Jan..report month).
+                months = [f"{year:04d}-{m:02d}" for m in range(1, month + 1)]
+                self._volunteer_hours_ytd_breakdown = vh.aggregate_monthly_breakdown(
+                    src, months, self.EXCLUDED_USERS)
+            else:
+                # Fallback: fetch the month on its own if the YTD fetch failed.
+                self._volunteer_hours = vh.get_volunteer_hours(
+                    month_start, month_end, self.EXCLUDED_USERS, refresh=True)
+
+        for label, summary in (("month", self._volunteer_hours),
+                               ("YTD", self._volunteer_hours_ytd)):
+            if not summary:
+                continue
+            if summary.get("unavailable"):
+                logger.warning("Volunteer hours (%s) unavailable", label)
+            else:
+                logger.info("Volunteer hours (%s): %.1fh across %d volunteers (%d sessions)",
+                            label, summary.get("total_hours", 0),
+                            summary.get("volunteer_count", 0), summary.get("total_sessions", 0))
+
+    def _volunteer_name_map(self) -> Dict[str, str]:
+        """Map lowercased login/username -> display name, from the XTM roster.
+        Falls back to an empty map (callers default to the login) on failure."""
+        try:
+            roster = self.get_volunteers()
+            return {info.get('username', '').lower(): info.get('user') or info.get('username', '')
+                    for info in roster.values() if info.get('username')}
+        except Exception as e:
+            logger.warning("Could not build volunteer name map: %s", e)
+            return {}
+
+    def _volunteer_language_map(self) -> Dict[str, str]:
+        """Map lowercased login/username -> comma-joined assigned target
+        languages, from the XTM roster. Empty map on failure."""
+        try:
+            roster = self.get_volunteers()
+            return {info.get('username', '').lower(): ', '.join(info.get('languages') or [])
+                    for info in roster.values() if info.get('username')}
+        except Exception as e:
+            logger.warning("Could not build volunteer language map: %s", e)
+            return {}
+
+    def _volunteer_hours_html(self) -> str:
+        """Render the current-period Volunteer Hours HTML section."""
+        period = (self.report_period if self.weekly
+                  else (self.report_month_name or self.report_month))
+        return self._render_volunteer_hours_html(
+            self._volunteer_hours, f"Volunteer Hours in XTM - {period}", "volunteerHoursTable")
+
+    def _volunteer_hours_html_ytd(self) -> str:
+        """Render the YTD Volunteer Hours HTML section: per-month breakdown table
+        plus a line chart of the top-10 volunteers' monthly trends (mirrors the
+        other year-to-date sections)."""
+        if self.weekly:
+            return ""
+        heading = f"⏱️ Volunteer Hours in XTM - Year-to-Date ({self.ytd_start_month} to {self.ytd_end_month})"
+        bd = self._volunteer_hours_ytd_breakdown
+        if not bd or not bd.get("by_user"):
+            summ = self._volunteer_hours_ytd
+            if summ and summ.get("unavailable"):
+                return f"""
+        <div class="section-divider"><h2>{heading}</h2></div>
+        <div class="data-card"><p style="color:#a00;">Volunteer login-history hours were
+        unavailable for the year-to-date period. All other data is unaffected.</p></div>"""
+            return ""
+
+        import volunteer_hours as _vh
+        months = bd["months"]
+        by_user = bd["by_user"]
+        name_by_login = self._volunteer_name_map()
+        lang_by_login = self._volunteer_language_map()
+        sorted_users = sorted(by_user.items(), key=lambda x: -x[1]["active_seconds"])
+
+        # Static line chart (hours per month), same helper as the other YTD charts.
+        chart_ds = [{'label': f"{name_by_login.get(login.lower(), login)} ({lang_by_login.get(login.lower(), '')})",
+                     'data': [round(ud['months'].get(m, 0) / 3600.0, 2) for m in months]}
+                    for login, ud in sorted_users[:10]]
+        chart_b64 = self._generate_line_chart_base64(months, chart_ds, 'Volunteer Hours Trends (Top 10)')
+
+        month_headers = "".join(
+            f"<th class=\"number sortable\" onclick=\"sortTable('volunteerHoursYtdTable', {i + 2})\">{m}</th>"
+            for i, m in enumerate(months))
+        total_idx = len(months) + 2
+        rows_html = ""
+        for login, ud in sorted_users:
+            cells = "".join(
+                f"<td class=\"number\" data-sort=\"{ud['months'].get(m, 0)}\">{_vh.format_hms(ud['months'].get(m, 0))}</td>"
+                for m in months)
+            rows_html += (
+                f"<tr><td>{name_by_login.get(login.lower(), login)}</td>"
+                f"<td>{lang_by_login.get(login.lower(), '')}</td>"
+                f"{cells}"
+                f"<td class=\"number\" data-sort=\"{ud['active_seconds']}\">{_vh.format_hms(ud['active_seconds'])}</td></tr>")
+
+        total_hms = _vh.format_hms(self._volunteer_hours_ytd.get('total_seconds', 0)
+                                   if self._volunteer_hours_ytd else 0)
+        vol_count = self._volunteer_hours_ytd.get('volunteer_count', len(by_user)) if self._volunteer_hours_ytd else len(by_user)
+        return f"""
+        <div class="section-divider">
+            <h2>{heading}</h2>
+        </div>
+        <div class="data-row">
+            <div class="data-card">
+                <h3>📈 Hours Trend</h3>
+                <img class="chart-img" src="data:image/png;base64,{chart_b64}" alt="YTD Volunteer Hours Chart">
+                <p style="font-size:0.85em;color:#666;">Total YTD active time: {total_hms} (h:mm:ss)
+                across {vol_count} volunteers. Active time = login to last action per session.</p>
+            </div>
+            <div class="data-card">
+                <h3>📊 Monthly Hours by Volunteer</h3>
+                <div class="table-container">
+                    <table id="volunteerHoursYtdTable">
+                        <thead>
+                            <tr>
+                                <th class="sortable" onclick="sortTable('volunteerHoursYtdTable', 0)">Volunteer</th>
+                                <th class="sortable" onclick="sortTable('volunteerHoursYtdTable', 1)">Language</th>
+                                {month_headers}
+                                <th class="number sortable" onclick="sortTable('volunteerHoursYtdTable', {total_idx})">Total (h:mm:ss)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {rows_html}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>"""
+
+    def _render_volunteer_hours_html(self, vh: Dict, heading: str, table_id: str) -> str:
+        """Render a Volunteer Hours HTML section from a summary dict."""
+        if not vh:
+            return ""
+        if vh.get("unavailable") or not vh.get("by_user"):
+            return f"""
+        <div class="section-divider">
+            <h2>⏱️ {heading}</h2>
+        </div>
+        <div class="data-card">
+            <p style="color:#a00;">Volunteer login-history hours were unavailable for this
+            period (the interactive XTM login fetch did not complete). All other data is unaffected.</p>
+        </div>"""
+
+        import volunteer_hours as _vh
+        name_by_login = self._volunteer_name_map()
+        lang_by_login = self._volunteer_language_map()
+        rows = sorted(vh["by_user"].items(), key=lambda x: -x[1]["active_seconds"])
+        body = "".join(
+            f"<tr><td>{name_by_login.get(login.lower(), login)}</td>"
+            f"<td>{lang_by_login.get(login.lower(), '')}</td>"
+            f"<td class=\"number\" data-sort=\"{d['active_seconds']}\">{_vh.format_hms(d['active_seconds'])}</td>"
+            f"<td class=\"number\">{d['sessions']}</td></tr>"
+            for login, d in rows
+        )
+        total_hms = _vh.format_hms(vh.get("total_seconds", 0))
+        return f"""
+        <div class="section-divider">
+            <h2>⏱️ {heading}</h2>
+        </div>
+        <div class="data-row">
+            <div class="data-card">
+                <h3>📈 Summary</h3>
+                <p><strong>Total active time:</strong> {total_hms} (h:mm:ss)<br>
+                <strong>Volunteers active:</strong> {vh['volunteer_count']}<br>
+                <strong>Total login sessions:</strong> {vh['total_sessions']:,}</p>
+                <p style="font-size:0.85em;color:#666;">Active time = login to the last recorded
+                action in each session (excludes idle time before logout). Source: XTM
+                login/logout history (minute precision, so seconds show as 00).</p>
+            </div>
+            <div class="data-card">
+                <h3>📊 Time by Volunteer</h3>
+                <div class="table-container">
+                    <table id="{table_id}">
+                        <thead>
+                            <tr>
+                                <th class="sortable" onclick="sortTable('{table_id}', 0)">Volunteer</th>
+                                <th class="sortable" onclick="sortTable('{table_id}', 1)">Language</th>
+                                <th class="number sortable" onclick="sortTable('{table_id}', 2)">Active Time (h:mm:ss)</th>
+                                <th class="number sortable" onclick="sortTable('{table_id}', 3)">Sessions</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {body}
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>"""
+
+    def _create_volunteer_hours_sheet(self, wb):
+        """Add the current-period Volunteer Hours sheet, and (monthly) a YTD one."""
+        title = ("Weekly" if self.weekly else "Monthly") + " Volunteer Hours in XTM"
+        self._write_volunteer_hours_sheet(wb, self._volunteer_hours, "Volunteer Hours", title)
+        if not self.weekly:
+            self._write_volunteer_hours_ytd_sheet(wb)
+
+    def _write_volunteer_hours_ytd_sheet(self, wb):
+        """YTD Volunteer Hours sheet: per-month breakdown + line chart of the
+        top-10 volunteers' monthly trends (mirrors the 'User Stats - YTD' sheet)."""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.chart import LineChart, Reference
+        from openpyxl.chart.series import SeriesLabel
+        from openpyxl.utils import get_column_letter
+
+        bd = self._volunteer_hours_ytd_breakdown
+        if not bd or not bd.get("by_user"):
+            return
+        months = bd["months"]
+        by_user = bd["by_user"]
+        name_by_login = self._volunteer_name_map()
+        lang_by_login = self._volunteer_language_map()
+
+        ws = wb.create_sheet("Volunteer Hours YTD")
+        header_fill = PatternFill(start_color="366092", end_color="366092", fill_type="solid")
+
+        headers = ["Volunteer", "Language"] + months + ["Total"]
+        for col_idx, header in enumerate(headers, 1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center")
+
+        sorted_users = sorted(by_user.items(),
+                              key=lambda x: x[1]["active_seconds"], reverse=True)
+        total_col = len(headers)
+        for row_idx, (login, ud) in enumerate(sorted_users, 2):
+            ws.cell(row=row_idx, column=1, value=name_by_login.get(login.lower(), login))
+            ws.cell(row=row_idx, column=2, value=lang_by_login.get(login.lower(), ""))
+            for col_idx, month in enumerate(months, 3):
+                secs = ud["months"].get(month, 0)
+                # Real Excel duration (fraction of a day) shown as [h]:mm:ss.
+                c = ws.cell(row=row_idx, column=col_idx, value=secs / 86400.0)
+                c.number_format = "[h]:mm:ss"
+                c.alignment = Alignment(horizontal="right")
+            tcell = ws.cell(row=row_idx, column=total_col, value=ud["active_seconds"] / 86400.0)
+            tcell.number_format = "[h]:mm:ss"
+            tcell.font = Font(bold=True)
+            tcell.fill = PatternFill(start_color="F0F7FF", end_color="F0F7FF", fill_type="solid")
+            tcell.alignment = Alignment(horizontal="right")
+
+        ws.column_dimensions["A"].width = 30
+        ws.column_dimensions["B"].width = 24
+        for col_idx in range(3, total_col + 1):
+            ws.column_dimensions[get_column_letter(col_idx)].width = 12
+        ws.auto_filter.ref = ws.dimensions
+
+        # Line chart: top 10 volunteers' monthly active-time trends.
+        num_users = min(10, len(sorted_users))
+        if num_users > 0:
+            chart = LineChart()
+            chart.title = "Volunteer Hours Trends (Top 10)"
+            chart.y_axis.title = "Active time (h:mm:ss)"
+            chart.x_axis.title = "Month"
+            for row_idx in range(2, num_users + 2):
+                data = Reference(ws, min_col=3, max_col=len(months) + 2,
+                                 min_row=row_idx, max_row=row_idx)
+                chart.add_data(data, titles_from_data=False)
+            cats = Reference(ws, min_col=3, max_col=len(months) + 2, min_row=1, max_row=1)
+            chart.set_categories(cats)
+            for idx, (login, ud) in enumerate(sorted_users[:num_users]):
+                sl = SeriesLabel()
+                sl.strRef = None
+                sl.v = f"{name_by_login.get(login.lower(), login)} ({lang_by_login.get(login.lower(), '')})"
+                chart.series[idx].tx = sl
+            chart.height = 15
+            chart.width = 25
+            ws.add_chart(chart, f"A{len(sorted_users) + 3}")
+
+    def _write_volunteer_hours_sheet(self, wb, vh, sheet_name, title):
+        """Write one Volunteer Hours sheet from a summary dict."""
+        from openpyxl.styles import Font, PatternFill, Alignment
+        from openpyxl.chart import BarChart, Reference
+
+        if not vh or vh.get("unavailable") or not vh.get("by_user"):
+            return
+
+        import volunteer_hours as _vh
+        name_by_login = self._volunteer_name_map()
+        lang_by_login = self._volunteer_language_map()
+
+        ws = wb.create_sheet(sheet_name)
+        header_font = Font(bold=True, color="FFFFFF")
+        header_fill = PatternFill(start_color="4472C4", end_color="4472C4", fill_type="solid")
+
+        ws["A1"] = title
+        ws["A1"].font = Font(bold=True, size=13)
+        ws["A2"] = (f"Total active time: {_vh.format_hms(vh.get('total_seconds', 0))} (h:mm:ss)   |   "
+                    f"Volunteers: {vh['volunteer_count']}   |   "
+                    f"Sessions: {vh['total_sessions']:,}")
+        ws["A3"] = ("Active time = login to last action in session (excludes idle time before "
+                    "logout). Source: XTM login/logout history (minute precision).")
+        ws["A3"].font = Font(italic=True, size=9, color="666666")
+
+        header_row = 5
+        # Column E holds numeric hours purely to drive the chart (hidden).
+        headers = ["Volunteer", "Language", "Active Time (h:mm:ss)", "Sessions", "Hours (chart)"]
+        for col, h in enumerate(headers, start=1):
+            c = ws.cell(row=header_row, column=col, value=h)
+            c.font = header_font
+            c.fill = header_fill
+            c.alignment = Alignment(horizontal="center")
+
+        rows = sorted(vh["by_user"].items(), key=lambda x: -x[1]["active_seconds"])
+        r = header_row + 1
+        for login, d in rows:
+            ws.cell(row=r, column=1, value=name_by_login.get(login.lower(), login))
+            ws.cell(row=r, column=2, value=lang_by_login.get(login.lower(), ""))
+            # Real Excel duration: value in days, displayed as [h]:mm:ss.
+            tcell = ws.cell(row=r, column=3, value=d["active_seconds"] / 86400.0)
+            tcell.number_format = "[h]:mm:ss"
+            ws.cell(row=r, column=4, value=d["sessions"])
+            ws.cell(row=r, column=5, value=round(d["active_seconds"] / 3600.0, 2))
+            r += 1
+
+        ws.column_dimensions["A"].width = 32
+        ws.column_dimensions["B"].width = 26
+        ws.column_dimensions["C"].width = 18
+        ws.column_dimensions["D"].width = 10
+        ws.column_dimensions["E"].hidden = True
+        ws.auto_filter.ref = f"A{header_row}:D{r - 1}"
+
+        # Bar chart of top 20 volunteers by active hours (numeric helper column E)
+        n = min(20, len(rows))
+        if n >= 1:
+            chart = BarChart()
+            chart.title = "Top Volunteers by Active Hours"
+            chart.type = "bar"
+            chart.y_axis.title = "Hours"
+            data = Reference(ws, min_col=5, min_row=header_row, max_row=header_row + n)
+            cats = Reference(ws, min_col=1, min_row=header_row + 1, max_row=header_row + n)
+            chart.add_data(data, titles_from_data=True)
+            chart.set_categories(cats)
+            chart.height = 12
+            chart.width = 22
+            ws.add_chart(chart, "G5")
+
     def generate_report(self):
         """Main method to generate and distribute the HTML/Excel report."""
         html_path = None
@@ -3203,6 +3592,10 @@ Best regards
                         ytd_langs.setdefault(lang, {})
             except Exception as e:
                 logger.warning(f"Failed to add full volunteer roster to user report: {e}")
+
+            # Volunteer time-in-XTM (from GUI login/logout history via Playwright).
+            # Best-effort: never blocks report generation.
+            self._compute_volunteer_hours()
 
             if not (monthly_data.get('workflow_by_language') or ytd_monthly_breakdown.get('languages')):
                 logger.warning("No data available for reporting period")
