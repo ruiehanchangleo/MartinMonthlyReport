@@ -1650,7 +1650,7 @@ class XTMReportGenerator:
         if not self.weekly:
             self._create_user_ytd_sheet(wb, ytd_monthly_breakdown)
 
-        # === VOLUNTEER HOURS SHEET (from XTM login/logout history) ===
+        # === VOLUNTEER HOURS SHEET (tracked translation time from XTM statistics API) ===
         self._create_volunteer_hours_sheet(wb)
 
         # Save workbook
@@ -3146,18 +3146,19 @@ Best regards
             return False
 
     def _compute_volunteer_hours(self):
-        """Fetch + aggregate volunteer active hours for the reporting period.
+        """Fetch tracked translation time per volunteer for the reporting period.
 
-        Uses the GUI login/logout history (Playwright helper). Best-effort:
-        stores an 'unavailable' summary on any failure so the report still
-        generates. Respects EXCLUDED_USERS.
+        Source: the async REST statistics report (reportType=USER) — real
+        per-job tracked time (targetStatistics.totalTime), what the UI shows as
+        "Translation time". Best-effort: stores an 'unavailable' summary on any
+        failure so the report still generates. Respects EXCLUDED_USERS.
         """
         try:
             import volunteer_hours as vh
         except Exception as e:
             logger.warning("volunteer_hours module unavailable: %s", e)
             self._volunteer_hours = {"by_user": {}, "unavailable": True,
-                                     "total_hours": 0.0, "total_sessions": 0,
+                                     "total_hours": 0.0, "total_jobs": 0,
                                      "volunteer_count": 0}
             return
 
@@ -3165,49 +3166,33 @@ Best regards
             # Weekly reports have no YTD; fetch just the week.
             period_start = self.report_start_date.date()
             period_end = self.report_end_date.date()
-            logger.info("Fetching volunteer login-history hours for %s..%s",
+            logger.info("Fetching volunteer translation time for %s..%s",
                         period_start, period_end)
-            self._volunteer_hours = vh.get_volunteer_hours(
-                period_start, period_end, self.EXCLUDED_USERS, refresh=True)
+            self._volunteer_hours = vh.get_translation_time(
+                self.base_url, self.headers, period_start, period_end, self.EXCLUDED_USERS)
             self._volunteer_hours_ytd = None
         else:
             year, month = (int(x) for x in self.report_month.split('-'))
-            month_start = datetime(year, month, 1).date()
-            # last day of the report month = day before the first of next month
-            next_month = datetime(year + (month == 12), (month % 12) + 1, 1).date()
-            month_end = next_month - timedelta(days=1)
-            ytd_start = datetime(year, 1, 1).date()
-            ytd_end = month_end
-
-            # Fetch the whole YTD range once; derive the current month from the
-            # same fetched data (no second browser login/fetch).
-            logger.info("Fetching volunteer login-history hours (YTD) for %s..%s",
-                        ytd_start, ytd_end)
-            self._volunteer_hours_ytd = vh.get_volunteer_hours(
-                ytd_start, ytd_end, self.EXCLUDED_USERS, refresh=True)
-            src = self._volunteer_hours_ytd.get("source_file")
-            if src and not self._volunteer_hours_ytd.get("unavailable"):
-                self._volunteer_hours = vh.aggregate_from_file(
-                    src, month_start, month_end, self.EXCLUDED_USERS)
-                # Per-month breakdown for the YTD trend chart (Jan..report month).
-                months = [f"{year:04d}-{m:02d}" for m in range(1, month + 1)]
-                self._volunteer_hours_ytd_breakdown = vh.aggregate_monthly_breakdown(
-                    src, months, self.EXCLUDED_USERS)
-            else:
-                # Fallback: fetch the month on its own if the YTD fetch failed.
-                self._volunteer_hours = vh.get_volunteer_hours(
-                    month_start, month_end, self.EXCLUDED_USERS, refresh=True)
+            months = [f"{year:04d}-{m:02d}" for m in range(1, month + 1)]
+            logger.info("Fetching volunteer translation time (YTD %s..%s, %d months)",
+                        months[0], months[-1], len(months))
+            bd = vh.get_translation_time_monthly(
+                self.base_url, self.headers, months, self.EXCLUDED_USERS)
+            self._volunteer_hours_ytd_breakdown = bd
+            # Derive the current month and YTD totals from the same fetched data.
+            self._volunteer_hours = vh.summary_from_breakdown(bd, month=self.report_month)
+            self._volunteer_hours_ytd = vh.summary_from_breakdown(bd, month=None)
 
         for label, summary in (("month", self._volunteer_hours),
                                ("YTD", self._volunteer_hours_ytd)):
             if not summary:
                 continue
             if summary.get("unavailable"):
-                logger.warning("Volunteer hours (%s) unavailable", label)
+                logger.warning("Volunteer translation time (%s) unavailable", label)
             else:
-                logger.info("Volunteer hours (%s): %.1fh across %d volunteers (%d sessions)",
+                logger.info("Volunteer translation time (%s): %.1fh across %d volunteers (%d jobs)",
                             label, summary.get("total_hours", 0),
-                            summary.get("volunteer_count", 0), summary.get("total_sessions", 0))
+                            summary.get("volunteer_count", 0), summary.get("total_jobs", 0))
 
     def _volunteer_name_map(self) -> Dict[str, str]:
         """Map lowercased login/username -> display name, from the XTM roster.
@@ -3294,8 +3279,8 @@ Best regards
             <div class="data-card">
                 <h3>📈 Hours Trend</h3>
                 <img class="chart-img" src="data:image/png;base64,{chart_b64}" alt="YTD Volunteer Hours Chart">
-                <p style="font-size:0.85em;color:#666;">Total YTD active time: {total_hms} (h:mm:ss)
-                across {vol_count} volunteers. Active time = login to last action per session.</p>
+                <p style="font-size:0.85em;color:#666;">Total YTD translation time: {total_hms} (h:mm:ss)
+                across {vol_count} volunteers. Tracked editing time from the XTM statistics API.</p>
             </div>
             <div class="data-card">
                 <h3>📊 Monthly Hours by Volunteer</h3>
@@ -3339,7 +3324,7 @@ Best regards
             f"<tr><td>{name_by_login.get(login.lower(), login)}</td>"
             f"<td>{lang_by_login.get(login.lower(), '')}</td>"
             f"<td class=\"number\" data-sort=\"{d['active_seconds']}\">{_vh.format_hms(d['active_seconds'])}</td>"
-            f"<td class=\"number\">{d['sessions']}</td></tr>"
+            f"<td class=\"number\">{d.get('jobs', 0)}</td></tr>"
             for login, d in rows
         )
         total_hms = _vh.format_hms(vh.get("total_seconds", 0))
@@ -3350,12 +3335,12 @@ Best regards
         <div class="data-row">
             <div class="data-card">
                 <h3>📈 Summary</h3>
-                <p><strong>Total active time:</strong> {total_hms} (h:mm:ss)<br>
+                <p><strong>Total translation time:</strong> {total_hms} (h:mm:ss)<br>
                 <strong>Volunteers active:</strong> {vh['volunteer_count']}<br>
-                <strong>Total login sessions:</strong> {vh['total_sessions']:,}</p>
-                <p style="font-size:0.85em;color:#666;">Active time = login to the last recorded
-                action in each session (excludes idle time before logout). Source: XTM
-                login/logout history (minute precision, so seconds show as 00).</p>
+                <strong>Total jobs:</strong> {vh.get('total_jobs', 0):,}</p>
+                <p style="font-size:0.85em;color:#666;">Translation time = tracked time spent
+                editing in XTM (targetStatistics.totalTime), the same figure shown in the XTM UI.
+                Source: XTM statistics API.</p>
             </div>
             <div class="data-card">
                 <h3>📊 Time by Volunteer</h3>
@@ -3365,8 +3350,8 @@ Best regards
                             <tr>
                                 <th class="sortable" onclick="sortTable('{table_id}', 0)">Volunteer</th>
                                 <th class="sortable" onclick="sortTable('{table_id}', 1)">Language</th>
-                                <th class="number sortable" onclick="sortTable('{table_id}', 2)">Active Time (h:mm:ss)</th>
-                                <th class="number sortable" onclick="sortTable('{table_id}', 3)">Sessions</th>
+                                <th class="number sortable" onclick="sortTable('{table_id}', 2)">Translation Time (h:mm:ss)</th>
+                                <th class="number sortable" onclick="sortTable('{table_id}', 3)">Jobs</th>
                             </tr>
                         </thead>
                         <tbody>
@@ -3474,16 +3459,16 @@ Best regards
 
         ws["A1"] = title
         ws["A1"].font = Font(bold=True, size=13)
-        ws["A2"] = (f"Total active time: {_vh.format_hms(vh.get('total_seconds', 0))} (h:mm:ss)   |   "
+        ws["A2"] = (f"Total translation time: {_vh.format_hms(vh.get('total_seconds', 0))} (h:mm:ss)   |   "
                     f"Volunteers: {vh['volunteer_count']}   |   "
-                    f"Sessions: {vh['total_sessions']:,}")
-        ws["A3"] = ("Active time = login to last action in session (excludes idle time before "
-                    "logout). Source: XTM login/logout history (minute precision).")
+                    f"Jobs: {vh.get('total_jobs', 0):,}")
+        ws["A3"] = ("Translation time = tracked editing time in XTM "
+                    "(targetStatistics.totalTime), same as the XTM UI. Source: XTM statistics API.")
         ws["A3"].font = Font(italic=True, size=9, color="666666")
 
         header_row = 5
         # Column E holds numeric hours purely to drive the chart (hidden).
-        headers = ["Volunteer", "Language", "Active Time (h:mm:ss)", "Sessions", "Hours (chart)"]
+        headers = ["Volunteer", "Language", "Translation Time (h:mm:ss)", "Jobs", "Hours (chart)"]
         for col, h in enumerate(headers, start=1):
             c = ws.cell(row=header_row, column=col, value=h)
             c.font = header_font
@@ -3498,7 +3483,7 @@ Best regards
             # Real Excel duration: value in days, displayed as [h]:mm:ss.
             tcell = ws.cell(row=r, column=3, value=d["active_seconds"] / 86400.0)
             tcell.number_format = "[h]:mm:ss"
-            ws.cell(row=r, column=4, value=d["sessions"])
+            ws.cell(row=r, column=4, value=d.get("jobs", 0))
             ws.cell(row=r, column=5, value=round(d["active_seconds"] / 3600.0, 2))
             r += 1
 
@@ -3593,7 +3578,7 @@ Best regards
             except Exception as e:
                 logger.warning(f"Failed to add full volunteer roster to user report: {e}")
 
-            # Volunteer time-in-XTM (from GUI login/logout history via Playwright).
+            # Volunteer translation time (tracked editing time from XTM statistics API).
             # Best-effort: never blocks report generation.
             self._compute_volunteer_hours()
 

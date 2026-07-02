@@ -85,12 +85,21 @@ const index = [];
   const page = ctx.pages()[0] || (await ctx.newPage());
   await page.goto(START_URL, { waitUntil: 'domcontentloaded' }).catch(() => {});
 
+  // Auto-submit the pre-filled XTM login form (creds saved in the profile).
+  await page.waitForTimeout(2500);
+  try {
+    const pw = page.locator('input[type="password"]');
+    if ((await pw.count()) && (await pw.first().inputValue())) {
+      const submit = page.locator('button[type="submit"]');
+      if (await submit.count()) { await submit.first().click({ timeout: 4000 }); }
+    }
+  } catch (_) {}
+
   console.log('\n' + '='.repeat(70));
-  console.log('BROWSER OPEN. Do the following in the window:');
-  console.log('  1. Log in (SSO / MFA) if prompted.');
-  console.log('  2. Navigate to the screen that shows user LOGIN / LOGOUT history.');
-  console.log('  3. Click into a user / open the history so it loads its data.');
-  console.log('  4. Then CLOSE the browser window (or press Ctrl-C here).');
+  console.log('BROWSER OPEN (auto-login attempted). In the window:');
+  console.log('  1. Open a PROJECT and go to its Statistics view');
+  console.log('     (the one showing "Translation time [hh:mm:ss]").');
+  console.log('  2. Let it load, then CLOSE the browser window.');
   console.log(`Captures -> ${CAPTURE_DIR}`);
   console.log('='.repeat(70) + '\n');
 
