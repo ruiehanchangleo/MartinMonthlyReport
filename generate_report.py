@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Dict, List, Any, Callable
 from functools import wraps
 import requests
+from send_via_mail import send_mail  # Mail.app send + Sent-verify (Outlook parks in Drafts)
 
 
 
@@ -2802,116 +2803,19 @@ Please check the log file at:
 
             body += "\n\nPlease investigate and re-run manually if needed."
 
-            # Escape for AppleScript
-            subject_escaped = subject.replace('\\', '\\\\').replace('"', '\\"')
-            body_escaped = body.replace('\\', '\\\\').replace('"', '\\"')
-
             # Use error_recipients if specified, otherwise fall back to email_recipients
             recipients = self.config.get('error_recipients', self.config.get('email_recipients', []))
             if recipients:
-                # Try simple notification email via Mail app
-                recipients_script = ""
-                for recipient in recipients:
-                    recipient_escaped = recipient.replace('\\', '\\\\').replace('"', '\\"')
-                    recipients_script += f'make new to recipient at end of to recipients of new_message with properties {{address:"{recipient_escaped}"}}\n'
-
-                applescript = f'''
-                tell application "Mail"
-                    set new_message to make new outgoing message with properties {{subject:"{subject_escaped}", visible:false}}
-                    tell new_message
-                        {recipients_script}
-                        set the content to "{body_escaped}"
-                    end tell
-                    send new_message
-                end tell
-                '''
-
-                subprocess.run(
-                    ['osascript', '-e', applescript],
-                    capture_output=True,
-                    text=True,
-                    timeout=30
-                )
-                logger.info("Failure notification email sent")
+                ok, detail = send_mail(recipients, subject, body)
+                logger.info("Failure notification email sent + verified" if ok
+                            else f"Failure notification email NOT sent: {detail}")
         except Exception as e:
             logger.warning(f"Could not send failure email notification: {e}")
-
-    def _ensure_outlook_running(self) -> bool:
-        """Ensure Microsoft Outlook is running, launch if needed."""
-        try:
-            # Check if Outlook is running
-            check_script = '''
-            tell application "System Events"
-                return (name of processes) contains "Microsoft Outlook"
-            end tell
-            '''
-
-            result = subprocess.run(
-                ['osascript', '-e', check_script],
-                capture_output=True,
-                text=True,
-                timeout=10
-            )
-
-            is_running = result.stdout.strip() == "true"
-
-            if is_running:
-                logger.info("Microsoft Outlook is already running")
-                return True
-
-            # Launch Outlook
-            logger.info("Microsoft Outlook is not running. Launching...")
-            launch_script = '''
-            tell application "Microsoft Outlook"
-                activate
-            end tell
-            '''
-
-            result = subprocess.run(
-                ['osascript', '-e', launch_script],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                # Wait for Outlook to fully start (up to 30 seconds)
-                logger.info("Waiting for Outlook to start...")
-                import time
-                for i in range(30):
-                    time.sleep(1)
-                    check_result = subprocess.run(
-                        ['osascript', '-e', check_script],
-                        capture_output=True,
-                        text=True,
-                        timeout=10
-                    )
-                    if check_result.stdout.strip() == "true":
-                        logger.info(f"Outlook started successfully after {i+1} seconds")
-                        # Give it a couple more seconds to fully initialize
-                        time.sleep(3)
-                        return True
-
-                logger.warning("Outlook did not start within 30 seconds")
-                return False
-            else:
-                logger.warning(f"Failed to launch Outlook: {result.stderr}")
-                return False
-
-        except Exception as e:
-            logger.warning(f"Error checking/launching Outlook: {e}")
-            return False
 
     def send_email_via_outlook(self, html_path: str, excel_path: str, monthly_data: Dict, ytd_data: Dict):
         """Create and open email draft in Outlook (macOS version) with both HTML and Excel attachments."""
         try:
-            logger.info("Preparing to send email via Outlook")
-
-            # Ensure Outlook is running (especially important for auto-send)
-            if self.auto_send:
-                if not self._ensure_outlook_running():
-                    logger.error("Could not ensure Outlook is running. Falling back to Apple Mail.")
-                    # Fall through to Apple Mail attempt below
+            logger.info("Preparing to send email via Mail.app")
 
             # Calculate summary statistics
             monthly_stats = self._calculate_summary_stats(monthly_data)
@@ -2987,36 +2891,26 @@ Report Generated: {self.report_date.strftime('%Y-%m-%d %H:%M')}
 Best regards
 """
 
-            # Escape quotes and backslashes for AppleScript
-            subject_escaped = subject.replace('\\', '\\\\').replace('"', '\\"')
-            body_escaped = body.replace('\\', '\\\\').replace('"', '\\"')
-            html_path_posix = Path(html_path).as_posix()
-            excel_path_posix = Path(excel_path).as_posix()
-
             # Use weekly_recipients for weekly reports, email_recipients for monthly
             if self.weekly:
                 recipients = self.config.get('weekly_recipients', self.config['email_recipients'])
             else:
                 recipients = self.config['email_recipients']
 
-            # Try Microsoft Outlook first (already ensured it's running if auto_send)
-            outlook_result = self._create_outlook_email_mac(subject_escaped, body_escaped, recipients,
-                                                           html_path_posix, excel_path_posix)
-            if outlook_result:
+            # Send (auto_send) or compose a draft for review via Mail.app + verify.
+            # Outlook's AppleScript send parks messages in Drafts under New Outlook mode.
+            ok, detail = send_mail(recipients, subject, body,
+                                   attachments=[html_path, excel_path],
+                                   draft_only=not self.auto_send)
+            if ok:
+                logger.info(f"Email {'sent + verified' if self.auto_send else 'draft composed'} via Mail.app")
                 return len(recipients)
 
-            # Fall back to Apple Mail
-            logger.info("Microsoft Outlook not available, trying Apple Mail")
-            apple_result = self._create_apple_mail_email(subject_escaped, body_escaped, recipients,
-                                                        html_path_posix, excel_path_posix)
-            if apple_result:
-                return len(recipients)
-
-            # If both fail, just open the reports
-            logger.warning("Could not create email draft. Opening report files.")
+            # Fallback: open the reports so they can be sent manually
+            logger.warning(f"Mail.app send failed ({detail}). Opening report files.")
             subprocess.run(['open', html_path])
             subprocess.run(['open', excel_path])
-            print(f"\n⚠ Email draft creation failed. Reports opened:")
+            print(f"\n⚠ Email send failed ({detail}). Reports opened:")
             print(f"  HTML: {html_path}")
             print(f"  Excel: {excel_path}")
             print(f"Recipients: {', '.join(recipients)}")
@@ -3026,124 +2920,6 @@ Best regards
             logger.info(f"HTML report saved to: {html_path}")
             logger.info(f"Excel report saved to: {excel_path}")
             raise
-
-    def _create_outlook_email_mac(self, subject: str, body: str, recipients: List[str],
-                                 html_path: str, excel_path: str) -> bool:
-        """Create email draft in Microsoft Outlook for Mac using AppleScript with both attachments."""
-        try:
-            # Build recipient list for AppleScript - simpler syntax
-            recipients_script = ""
-            for recipient in recipients:
-                recipient_escaped = recipient.replace('\\', '\\\\').replace('"', '\\"')
-                recipients_script += f'make new to recipient with properties {{email address:{{address:"{recipient_escaped}"}}}}\n'
-
-            # Different AppleScript depending on whether we're sending or just creating draft
-            if self.auto_send:
-                applescript = f'''
-                tell application "Microsoft Outlook"
-                    set new_message to make new outgoing message with properties {{subject:"{subject}", content:"{body}"}}
-                    tell new_message
-                        {recipients_script}
-                        make new attachment with properties {{file:POSIX file "{html_path}"}}
-                        make new attachment with properties {{file:POSIX file "{excel_path}"}}
-                        send
-                    end tell
-                end tell
-                '''
-            else:
-                applescript = f'''
-                tell application "Microsoft Outlook"
-                    set new_message to make new outgoing message with properties {{subject:"{subject}", content:"{body}"}}
-                    tell new_message
-                        {recipients_script}
-                        make new attachment with properties {{file:POSIX file "{html_path}"}}
-                        make new attachment with properties {{file:POSIX file "{excel_path}"}}
-                    end tell
-                    open new_message
-                    activate
-                end tell
-                '''
-
-            result = subprocess.run(
-                ['osascript', '-e', applescript],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                if self.auto_send:
-                    logger.info("Microsoft Outlook email sent successfully")
-                else:
-                    logger.info("Microsoft Outlook email draft created successfully")
-                return True
-            else:
-                logger.warning(f"Outlook AppleScript failed: {result.stderr}")
-                return False
-
-        except Exception as e:
-            logger.warning(f"Failed to create Outlook email on Mac: {e}")
-            return False
-
-    def _create_apple_mail_email(self, subject: str, body: str, recipients: List[str],
-                                html_path: str, excel_path: str) -> bool:
-        """Create email draft in Apple Mail using AppleScript with both attachments."""
-        try:
-            # Build recipient list for AppleScript
-            recipients_script = ""
-            for recipient in recipients:
-                recipient_escaped = recipient.replace('\\', '\\\\').replace('"', '\\"')
-                recipients_script += f'make new to recipient at end of to recipients of new_message with properties {{address:"{recipient_escaped}"}}\n'
-
-            # Different AppleScript depending on whether we're sending or just creating draft
-            # Use simple attachment without positioning to avoid HTML file creation
-            if self.auto_send:
-                applescript = f'''
-                tell application "Mail"
-                    set new_message to make new outgoing message with properties {{subject:"{subject}", sender:"leo.chang@familysearch.org"}}
-                    tell new_message
-                        {recipients_script}
-                        set the content to "{body}"
-                        make new attachment with properties {{file name:POSIX file "{html_path}"}}
-                        make new attachment with properties {{file name:POSIX file "{excel_path}"}}
-                    end tell
-                    send new_message
-                end tell
-                '''
-            else:
-                applescript = f'''
-                tell application "Mail"
-                    set new_message to make new outgoing message with properties {{subject:"{subject}", visible:true, sender:"leo.chang@familysearch.org"}}
-                    tell new_message
-                        {recipients_script}
-                        set the content to "{body}"
-                        make new attachment with properties {{file name:POSIX file "{html_path}"}}
-                        make new attachment with properties {{file name:POSIX file "{excel_path}"}}
-                    end tell
-                    activate
-                end tell
-                '''
-
-            result = subprocess.run(
-                ['osascript', '-e', applescript],
-                capture_output=True,
-                text=True,
-                timeout=30
-            )
-
-            if result.returncode == 0:
-                if self.auto_send:
-                    logger.info("Apple Mail email sent successfully")
-                else:
-                    logger.info("Apple Mail email draft created successfully")
-                return True
-            else:
-                logger.warning(f"Apple Mail AppleScript failed: {result.stderr}")
-                return False
-
-        except Exception as e:
-            logger.warning(f"Failed to create Apple Mail email: {e}")
-            return False
 
     def _compute_volunteer_hours(self):
         """Fetch tracked translation time per volunteer for the reporting period.
