@@ -18,7 +18,8 @@ is never touched.
 
 Canonical copy lives in the XTM-glossary repo; an identical copy is dropped into
 each mail-sending project so each stays self-contained. Keep copies in sync
-(all four are byte-identical — deploy changes to every copy).
+(5 byte-identical copies: XTM glossary, XTM glossary/translation-tracker,
+XTMProjectFilesReport, MartinMonthlyReport, mt-api — deploy changes to every copy).
 
 Import:
     from send_via_mail import send_mail
@@ -130,6 +131,45 @@ def _sent_count(subject, window_secs=900):
     return None
 
 
+def _delete_drafts(subject, timeout=25):
+    """Best-effort: delete drafts whose subject EXACTLY matches `subject`.
+
+    `send_mail` composes an outgoing message BEFORE it sends it, and Mail leaves
+    that composed copy in Drafts even when the send SUCCEEDS (confirmed
+    empirically), as well as when it fails (Mail wedges mid-flight, or the
+    message never reaches Sent). Either way it syncs to the server — the slow
+    trickle of parked drafts seen after the 2026-07-14 pileup. These
+    auto-send subjects are unique/dated, so any draft matching one is a prior
+    failed attempt of the same message and is safe to remove. Only ever touches
+    the Drafts mailbox (a genuinely-queued Outbox message is elsewhere and is
+    left alone). Bounded and swallows all errors so it can never block or fail a
+    send. Returns count deleted (0 on any error). `before`/`after` are reserved
+    AppleScript keywords, so this uses none.
+    """
+    q = ('tell application "Mail"\n'
+         f'  set subj to "{_esc(subject)}"\n'
+         '  set n to 0\n'
+         '  repeat\n'
+         '    set msgs to (messages of drafts mailbox whose subject is subj)\n'
+         '    if (count of msgs) is 0 then exit repeat\n'
+         '    repeat with m in msgs\n'
+         '      try\n'
+         '        delete m\n'
+         '        set n to n + 1\n'
+         '      end try\n'
+         '    end repeat\n'
+         '    if n > 500 then exit repeat\n'
+         '  end repeat\n'
+         '  return n\n'
+         'end tell')
+    try:
+        r = subprocess.run(["osascript", "-e", q], capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 0
+    out = (r.stdout or "").strip()
+    return int(out) if out.lstrip("-").isdigit() else 0
+
+
 def _run_send(sf_name):
     """Run the compiled send AppleScript. Returns (status, detail).
 
@@ -170,6 +210,11 @@ def send_mail(to, subject, body, sender=DEFAULT_SENDER, attachments=None,
                            "Security > Automation, from an interactive run (background jobs "
                            "can't answer the prompt).")
         return False, "Mail.app unresponsive and restart failed (" + detail + ")"
+
+    # Clear any drafts orphaned by a prior FAILED send of this same message
+    # (see _delete_drafts), so retries and repeat-subject sends don't accumulate.
+    if not draft_only:
+        _delete_drafts(subject)
 
     baseline = 0 if draft_only else _sent_count(subject)
     if baseline is None:
@@ -216,6 +261,10 @@ def send_mail(to, subject, body, sender=DEFAULT_SENDER, attachments=None,
             if restarted:
                 status, detail = _run_send(sf.name)
         if status != "ok":
+            # The message may have been composed before the send failed — don't
+            # leave it orphaned in Drafts.
+            if not draft_only:
+                _delete_drafts(subject)
             return False, detail
     finally:
         for f in (bf.name, sf.name):
@@ -231,8 +280,17 @@ def send_mail(to, subject, body, sender=DEFAULT_SENDER, attachments=None,
     while time.time() < deadline:
         cur = _sent_count(subject)
         if cur is not None and cur > baseline:
+            # Mail leaves the composed message in Drafts even on a SUCCESSFUL send
+            # (confirmed empirically) — and a restart+retry can orphan the first
+            # attempt too. The verified copy is in Sent, so sweeping Drafts by
+            # subject only removes the leftover.
+            _delete_drafts(subject)
             return True, "sent + verified in Sent mailbox"
         time.sleep(3)
+    # Verify failed: the composed message never reached Sent. Remove it from
+    # Drafts if it parked there (a genuinely queued Outbox message is in a
+    # different mailbox and is left untouched).
+    _delete_drafts(subject)
     return False, (f"send issued but not confirmed in Sent within {verify_timeout}s "
                    "(likely stuck in Mail Outbox — check the account's send/auth)")
 
